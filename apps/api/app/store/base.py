@@ -2,7 +2,7 @@
 
 Isolates persistence from Harness and Adapter logic.
 Default implementation for v0.1 is SQLiteStore.
-Future ChatXin migration replaces Store interface implementation
+Future persistence implementations can replace the Store interface
 without touching Harness logic.
 """
 

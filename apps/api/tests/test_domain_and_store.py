@@ -235,3 +235,77 @@ def test_sqlite_persistence_across_reconnect():
             assert messages[0].content == "Hello!"
         finally:
             store2.close()
+
+
+def test_sqlite_schema_upgrade_and_legacy_status_compatibility():
+    """Verify an older SQLite database without partial_output and with legacy status strings upgrades seamlessly."""
+    import sqlite3
+
+    with tempfile.TemporaryDirectory(prefix="kane_sqlite_upgrade_test_") as tmpdir:
+        db_file = Path(tmpdir) / "legacy_kane.db"
+
+        # Simulate older database created before partial_output column was introduced
+        conn = sqlite3.connect(str(db_file))
+        with conn:
+            conn.execute(
+                """
+                CREATE TABLE turns (
+                    turn_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    bound_agent_id TEXT NOT NULL,
+                    title TEXT,
+                    status TEXT NOT NULL,
+                    native_session_ref TEXT,
+                    last_event_at TEXT NOT NULL,
+                    interrupt_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
+                """
+            )
+            # Insert legacy turn with legacy status 'completed' and 'error'
+            conn.execute(
+                """
+                INSERT INTO turns VALUES (
+                    'turn_legacy_1', 'conv_leg', 'kanaloa', 'Old Task', 'completed',
+                    'sess_old', '2026-01-01T00:00:00Z', NULL, '2026-01-01T00:00:00Z', NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO turns VALUES (
+                    'turn_legacy_2', 'conv_leg', 'kanaloa', 'Failed Task', 'error',
+                    'sess_old2', '2026-01-01T00:00:00Z', 'unknown', '2026-01-01T00:00:00Z', NULL
+                );
+                """
+            )
+        conn.close()
+
+        # Open with new SQLiteStore
+        store = SQLiteStore(db_file)
+        try:
+            # 1. Verify schema upgrade occurred: partial_output column exists
+            raw_conn = store._get_connection()
+            cols = {row["name"] for row in raw_conn.execute("PRAGMA table_info(turns);").fetchall()}
+            assert "partial_output" in cols
+
+            # 2. Verify legacy status 'completed' normalized to 'finished'
+            turn1 = store.get_turn("turn_legacy_1")
+            assert turn1 is not None
+            assert turn1.status == "finished"
+            assert turn1.partial_output is None
+
+            # 3. Verify legacy status 'error' normalized to 'failed'
+            turn2 = store.get_turn("turn_legacy_2")
+            assert turn2 is not None
+            assert turn2.status == "failed"
+
+            # 4. Verify we can now save partial_output to existing upgraded turn
+            turn1.partial_output = "Fresh partial output after migration"
+            store.save_turn(turn1)
+
+            reloaded = store.get_turn("turn_legacy_1")
+            assert reloaded.partial_output == "Fresh partial output after migration"
+        finally:
+            store.close()

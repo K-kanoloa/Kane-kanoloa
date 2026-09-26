@@ -141,6 +141,12 @@ class SQLiteStore(BaseStore):
                 """
             )
 
+            # Lightweight schema migration for existing databases
+            cursor = conn.execute("PRAGMA table_info(turns);")
+            existing_columns = {row["name"] for row in cursor.fetchall()}
+            if "partial_output" not in existing_columns:
+                conn.execute("ALTER TABLE turns ADD COLUMN partial_output TEXT;")
+
     # --- Conversation Operations ---
     def save_conversation(self, conversation: Conversation) -> None:
         conn = self._get_connection()
@@ -304,6 +310,23 @@ class SQLiteStore(BaseStore):
                 ),
             )
 
+    @staticmethod
+    def _normalize_turn_data(data: dict) -> dict:
+        valid_statuses = {"running", "waiting_user", "finished", "failed", "interrupted"}
+        status = data.get("status")
+        if status not in valid_statuses:
+            legacy_map = {
+                "completed": "finished",
+                "done": "finished",
+                "waiting": "waiting_user",
+                "paused": "waiting_user",
+                "error": "failed",
+                "aborted": "interrupted",
+                "stopped": "interrupted",
+            }
+            data["status"] = legacy_map.get(str(status).lower(), "interrupted")
+        return data
+
     def get_turn(self, turn_id: str) -> Turn | None:
         conn = self._get_connection()
         row = conn.execute(
@@ -312,7 +335,7 @@ class SQLiteStore(BaseStore):
         ).fetchone()
         if not row:
             return None
-        return Turn(**dict(row))
+        return Turn(**self._normalize_turn_data(dict(row)))
 
     def list_turns(self, conversation_id: str) -> list[Turn]:
         conn = self._get_connection()
@@ -324,7 +347,7 @@ class SQLiteStore(BaseStore):
             """,
             (conversation_id,),
         ).fetchall()
-        return [Turn(**dict(r)) for r in rows]
+        return [Turn(**self._normalize_turn_data(dict(r))) for r in rows]
 
     # --- Turn Event Operations ---
     def append_event(self, event: TurnEvent) -> None:
