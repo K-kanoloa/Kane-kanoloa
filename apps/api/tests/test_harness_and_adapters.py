@@ -580,7 +580,7 @@ async def test_kanaloa_adapter_capabilities_and_session_binding(harness_env):
     assert caps.supports_approval is False
     assert caps.supports_parallel_sessions is True
     assert caps.max_parallel_sessions is None
-    assert caps.steer_mode == "follow_up_only"
+    assert caps.steer_mode == "native"
     assert caps.branch_mode == "unsupported"
 
     # Session binding
@@ -744,6 +744,7 @@ class MockWireKanaloaAdapter(KanaloaAdapter):
         super().__init__(**kwargs)
         self.cancel_notifs: list[dict[str, Any] | None] = []
         self.resumed_sessions: list[dict[str, Any] | None] = []
+        self.steer_requests: list[dict[str, Any] | None] = []
         self.sent_requests: list[tuple[str, dict[str, Any] | None]] = []
         self._new_session_id_counter = 1
 
@@ -767,6 +768,9 @@ class MockWireKanaloaAdapter(KanaloaAdapter):
             return {"result": {"configOptions": []}}
         if method == "session/prompt":
             return {"result": {"stopReason": "end_turn"}}
+        if method == "session/steer":
+            self.steer_requests.append(params)
+            return {"result": {"accepted": True}}
         if method == "session/close":
             return {"result": {}}
         return {"result": {}}
@@ -815,10 +819,16 @@ async def test_strict_capability_gates_cancel_and_resume(harness_env):
     with pytest.raises(RuntimeError, match="does not support native resume"):
         await dispatcher.resume_turn("t_gate2")
 
-    # 3. Direct steer call on KanaloaAdapter must also raise NotImplementedError since steer_mode="follow_up_only"
+    # 3. Direct steer call on KanaloaAdapter:
     kanaloa = KanaloaAdapter()
-    with pytest.raises(NotImplementedError, match="follow_up_only"):
+    assert kanaloa.capabilities().steer_mode == "native"
+    # Fails if session is not bound
+    with pytest.raises(ValueError, match="without active native session"):
         await kanaloa.steer(turn2, Message(conversation_id="c_gate2", sender="user", content="steer"))
+    # Fails if turn is in terminal status
+    terminal_turn = Turn(turn_id="t_term", conversation_id="c_gate2", bound_agent_id="kanaloa", status="interrupted", native_session_ref="sess_term")
+    with pytest.raises(RuntimeError, match="terminal status"):
+        await kanaloa.steer(terminal_turn, Message(conversation_id="c_gate2", sender="user", content="steer"))
 
 
 @pytest.mark.asyncio
@@ -1002,6 +1012,64 @@ async def test_kanaloa_adapter_dispatcher_control_flows(harness_env):
     assert resumed.status == "running"
     assert len(mock_kanaloa.resumed_sessions) == 1
     assert mock_kanaloa.resumed_sessions[0]["sessionId"] == "sess_wire_1"
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_native_steer_wire_protocol(harness_env):
+    """
+    Verify KanaloaAdapter Native Steer wire protocol over ACP:
+    - Same Turn, same native sessionId (sess_steer_wire)
+    - Execution remains running, no cancel+restart
+    - session/steer request sent with formatted ContentBlock prompt
+    - Multiple steers accepted in order
+    """
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    mock_kanaloa = MockWireKanaloaAdapter(event_handler=coord)
+    coord.register_adapter("kanaloa_steer", mock_kanaloa)
+
+    conv = Conversation(conversation_id="c_steer", bound_agent_id="kanaloa_steer")
+    store.save_conversation(conv)
+    turn = Turn(
+        turn_id="t_steer",
+        conversation_id="c_steer",
+        bound_agent_id="kanaloa_steer",
+        native_session_ref="sess_steer_wire",
+        status="running",
+    )
+    store.save_turn(turn)
+    mock_kanaloa.bind_session("t_steer", "sess_steer_wire")
+
+    # 1. Dispatch user message while turn is actively running -> Dispatcher invokes native steer directly
+    msg1, returned_turn = await dispatcher.dispatch_user_message(
+        "c_steer",
+        "Stop previous plan, switch to test suite generation.",
+        target_turn_id="t_steer",
+    )
+    assert returned_turn.turn_id == "t_steer"
+    assert returned_turn.status == "running"
+    assert returned_turn.native_session_ref == "sess_steer_wire"
+
+    # 2. Assert wire request was sent
+    assert len(mock_kanaloa.steer_requests) == 1
+    steer_req1 = mock_kanaloa.steer_requests[0]
+    assert steer_req1["sessionId"] == "sess_steer_wire"
+    assert steer_req1["prompt"] == [{"type": "text", "text": "Stop previous plan, switch to test suite generation."}]
+
+    # 3. Dispatch second steer message to verify multiple sequential steers
+    msg2, returned_turn2 = await dispatcher.dispatch_user_message(
+        "c_steer",
+        "Also include property-based tests.",
+        target_turn_id="t_steer",
+    )
+    assert returned_turn2.turn_id == "t_steer"
+    assert returned_turn2.status == "running"
+    assert len(mock_kanaloa.steer_requests) == 2
+    assert mock_kanaloa.steer_requests[1]["prompt"] == [{"type": "text", "text": "Also include property-based tests."}]
+
+    # 4. Zero cancellations occurred!
+    assert len(mock_kanaloa.cancel_notifs) == 0
+
 
 
 

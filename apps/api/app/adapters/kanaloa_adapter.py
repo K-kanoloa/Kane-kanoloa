@@ -14,7 +14,7 @@ Disciplines:
      - supports_approval = False (inbound request_permission -> waiting_user verified; full allow/deny response roundtrip pending)
      - supports_parallel_sessions = True (verified via multiple sessions on single connection)
      - max_parallel_sessions = None (not statically capped by adapter; bound by DSH/system resources)
-     - steer_mode = 'follow_up_only' (verified: ACP rejects mid-flight prompt with 'already in flight')
+     - steer_mode = 'native' (verified: session/steer extension submits steering to active native session mid-flight)
      - branch_mode = 'unsupported'
   4. Two-state Prompt semantics with Non-Negotiable Side-Effect Boundary:
      - State A (Active Session): incremental prompt only
@@ -86,7 +86,7 @@ class KanaloaAdapter(BaseAdapter):
         - supports_approval = False (inbound session/request_permission -> waiting_user verified; full allow/deny response roundtrip pending)
         - supports_parallel_sessions = True (verified: multiple sessions on single connection)
         - max_parallel_sessions = None (not statically capped by adapter; actual concurrency bound by DSH/system resources)
-        - steer_mode = 'follow_up_only' (verified: ACP rejects mid-flight prompt with 'already in flight')
+        - steer_mode = 'native' (verified: session/steer extension submits steering to active native session mid-flight)
         - branch_mode = 'unsupported'
         """
         return AgentCapabilities(
@@ -96,7 +96,7 @@ class KanaloaAdapter(BaseAdapter):
             supports_approval=False,
             supports_parallel_sessions=True,
             max_parallel_sessions=None,
-            steer_mode="follow_up_only",
+            steer_mode="native",
             branch_mode="unsupported",
         )
 
@@ -425,11 +425,31 @@ class KanaloaAdapter(BaseAdapter):
         message: Message,
     ) -> None:
         """
-        Verified Fact: ACP specification and DSH ACP reject concurrent prompts
-        with 'a prompt is already in flight for this session'.
-        Native mid-flight steer is therefore unsupported; degrades to follow_up_only.
+        Submit native steering for the running turn directly to DSH ACP
+        via the session/steer extension on the same stdio connection.
+        Preserves the same Turn and native sessionId without restart.
         """
-        raise NotImplementedError("ACP protocol rejects mid-flight concurrent prompts. Use follow_up_only mode.")
+        session_id = turn.native_session_ref or self.get_native_session(turn.turn_id)
+        if not session_id:
+            raise ValueError(f"Cannot steer turn '{turn.turn_id}' without active native session")
+
+        if turn.status in ("completed", "finished", "failed", "interrupted"):
+            raise RuntimeError(
+                f"Cannot steer turn '{turn.turn_id}': turn has terminal status '{turn.status}'"
+            )
+
+        resp = await self._send_request("session/steer", {
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": message.content}],
+        })
+        if "error" in resp:
+            err_msg = resp["error"].get("message", str(resp["error"]))
+            raise RuntimeError(f"DSH steer failed: {err_msg}")
+        logger.info(
+            "KanaloaAdapter: successfully submitted native steer to session %s for turn %s",
+            session_id,
+            turn.turn_id,
+        )
 
     async def cancel(
         self,
