@@ -234,9 +234,22 @@ class KanaloaACPAdapter(BaseAdapter):
                 if text:
                     await self.event_handler.emit_delta(turn_id, text)
         elif update_type in ("thought", "thinking"):
-            await self.event_handler.emit_event(turn_id, "thinking", update)
+            # Coarse live thinking status/event for UI; does NOT dump massive raw reasoning chains into turn_events
+            thought_text = update.get("thought") or update.get("content", "")
+            thinking_payload: dict[str, Any] = {"status": "thinking"}
+            if isinstance(thought_text, str) and thought_text.strip():
+                thinking_payload["summary"] = thought_text[:120].strip()
+            await self.event_handler.emit_event(turn_id, "thinking", thinking_payload)
         elif update_type in ("tool_call", "tool_start", "tool_result", "tool_end"):
-            await self.event_handler.emit_event(turn_id, update_type, update)
+            # Coarse tool event for UI observation
+            tool_name = update.get("toolName") or update.get("name") or update.get("tool", "")
+            tool_payload: dict[str, Any] = {
+                "type": update_type,
+                "tool": str(tool_name),
+            }
+            if "status" in update:
+                tool_payload["status"] = update["status"]
+            await self.event_handler.emit_event(turn_id, update_type, tool_payload)
 
     async def _handle_permission_request(self, msg: dict[str, Any]) -> None:
         """Handle permission request from ACP agent (e.g. file edit or command execution)."""
@@ -290,9 +303,9 @@ class KanaloaACPAdapter(BaseAdapter):
         - State B (Bootstrap / Session Rebuild): If session is new or rebuilt,
           RECONSTRUCTION != REPLAY HISTORICAL EXECUTION.
           Historical messages are passed ONLY as passive context transcript blocks;
-          NEVER as an executable command queue.
-          Only the current new message (message.content) is executed as the active prompt,
-          preventing duplicate real-world side effects.
+          guaranteeing 0 mechanical replay / 0 command queue replay.
+          Only the current new message (message.content) is executed as the active prompt.
+          External side-effect idempotency and approval policies remain governed by the Agent/Tool/Host layers.
         """
         await self._ensure_process()
 

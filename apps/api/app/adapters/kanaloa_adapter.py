@@ -123,8 +123,16 @@ class KanaloaAdapter(BaseAdapter):
             reason = payload.get("message") or payload.get("error") or "Unknown DSH error"
             await self.event_handler.emit_failed(turn_id, reason=str(reason))
 
-        elif event_type in ("thinking", "tool_start", "tool_end", "progress"):
-            # Map directly to ephemeral TurnEvent
+        elif event_type in ("thinking", "thought"):
+            # Coarse live thinking status/event for UI; does NOT dump massive raw reasoning chains into turn_events
+            thought_text = payload.get("thought") or payload.get("text", "")
+            thinking_payload: dict[str, Any] = {"status": "thinking"}
+            if isinstance(thought_text, str) and thought_text.strip():
+                thinking_payload["summary"] = thought_text[:120].strip()
+            await self.event_handler.emit_event(turn_id, "thinking", thinking_payload)
+
+        elif event_type in ("tool_start", "tool_end", "progress"):
+            # Coarse tool event for UI observation
             await self.event_handler.emit_event(turn_id, event_type, payload)
 
         else:
@@ -147,10 +155,9 @@ class KanaloaAdapter(BaseAdapter):
         - State B (Bootstrap / Session Rebuild): If session is new or rebuilt,
           RECONSTRUCTION != REPLAY HISTORICAL EXECUTION.
           Historical messages are passed ONLY as passive context / transcript ({role, content}),
-          NEVER as an executable command queue.
-          Only the current new message (message.content) is executed as the active prompt,
-          guaranteeing that historical operations with real-world side effects
-          (file modifications, git commits, emails, external API writes) are NEVER re-executed.
+          guaranteeing 0 mechanical replay / 0 command queue replay.
+          Only the current new message (message.content) is executed as the active prompt.
+          External side-effect idempotency and approval policies remain governed by the Agent/Tool/Host layers.
         """
         # Ensure session binding
         if not turn.native_session_ref:
