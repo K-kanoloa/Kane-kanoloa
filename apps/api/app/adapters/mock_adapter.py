@@ -120,3 +120,7 @@ class MockAdapter(BaseAdapter):
     async def simulate_interrupt(self, turn_id: str, reason: str) -> None:
         """Simulate agent being interrupted."""
         await self.event_handler.emit_interrupted(turn_id, reason)
+
+    async def simulate_reach_safe_boundary(self, turn_id: str) -> None:
+        """Simulate reaching a native execution boundary and signaling Kane."""
+        await self.event_handler.emit_boundary_signal(turn_id)

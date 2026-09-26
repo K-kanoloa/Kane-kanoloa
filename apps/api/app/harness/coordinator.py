@@ -252,3 +252,53 @@ class HarnessCoordinator(AgentEventHandler):
         )
         self.store.append_event(status_event)
         self._broadcast_event(status_event)
+
+    async def emit_boundary_signal(self, turn_id: str) -> None:
+        """
+        Adapter signals that the underlying agent has reached a native safe execution boundary.
+        Kane checks the Turn Mailbox for any pending 'steer' item,
+        and feeds it directly to adapter.steer().
+        The Agent does not touch or know about Kane's Mailbox.
+        """
+        turn = self.store.get_turn(turn_id)
+        if not turn:
+            raise ValueError(f"Turn '{turn_id}' not found")
+
+        mailbox = self.mailbox_manager.get_mailbox(turn_id)
+        pending_items = mailbox.peek_pending()
+        steer_item = None
+        for item in pending_items:
+            if item.item_type == "steer":
+                steer_item = item
+                break
+
+        if steer_item:
+            # Remove this steer item from mailbox queue
+            all_items = mailbox.drain_all()
+            for it in all_items:
+                if it.item_id != steer_item.item_id:
+                    mailbox.put_nowait(it)
+
+            msg_id = steer_item.payload.get("message_id")
+            steer_msg = self.store.get_message(msg_id) if msg_id else None
+            if not steer_msg:
+                steer_msg = Message(
+                    conversation_id=turn.conversation_id,
+                    sender="user",
+                    content=steer_item.payload.get("content", ""),
+                )
+
+            adapter = self.get_adapter(turn.bound_agent_id)
+            await adapter.steer(turn, steer_msg)
+
+            boundary_event = TurnEvent(
+                turn_id=turn_id,
+                conversation_id=turn.conversation_id,
+                event_type="status_change",
+                payload={
+                    "boundary": "safe_steer_injected",
+                    "message_id": steer_msg.message_id,
+                },
+            )
+            self.store.append_event(boundary_event)
+            self._broadcast_event(boundary_event)

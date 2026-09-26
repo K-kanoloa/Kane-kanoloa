@@ -87,18 +87,51 @@ class Dispatcher:
             if focus:
                 return focus
 
-        # 4. Create fresh Turn
+        # 4. Check existing turns in this conversation
+        existing_turns = self.store.list_turns(conversation_id)
+        if len(existing_turns) == 0:
+            # If conversation never had any Turn yet -> automatically create initial Turn
+            new_turn = Turn(
+                conversation_id=conversation_id,
+                bound_agent_id=conv.bound_agent_id,
+                status="running",
+                title="Initial Task",
+            )
+            self.store.save_turn(new_turn)
+
+            conv.focus_turn_id = new_turn.turn_id
+            conv.updated_at = current_iso()
+            self.store.save_conversation(conv)
+            return new_turn
+
+        # Conversation already has turns, but none could be resolved -> DO NOT silently spawn a new Turn!
+        raise ValueError(
+            f"target_turn_required: conversation '{conversation_id}' already has existing turns, "
+            f"but no target or focus turn could be resolved. "
+            f"Please specify an explicit target_turn_id or request a new task."
+        )
+
+    def create_new_turn(self, conversation_id: str, title: str | None = None) -> Turn:
+        """
+        Explicitly create an additional independent Turn for a conversation (New Task).
+        """
+        conv = self.store.get_conversation(conversation_id)
+        if not conv:
+            from ..domain.models import Conversation
+            conv = Conversation(conversation_id=conversation_id)
+            self.store.save_conversation(conv)
+
         new_turn = Turn(
             conversation_id=conversation_id,
             bound_agent_id=conv.bound_agent_id,
             status="running",
+            title=title or "New Task",
         )
         self.store.save_turn(new_turn)
 
         conv.focus_turn_id = new_turn.turn_id
         conv.updated_at = current_iso()
         self.store.save_conversation(conv)
-
         return new_turn
 
     async def dispatch_user_message(
@@ -108,6 +141,7 @@ class Dispatcher:
         target_turn_id: str | None = None,
         reply_to_message_id: str | None = None,
         parent_id: str | None = None,
+        is_new_task: bool = False,
     ) -> tuple[Message, Turn]:
         """
         Dispatch a user message to the conversation and target Turn.
@@ -124,11 +158,14 @@ class Dispatcher:
         self.store.append_message(user_msg)
 
         # 2. Deterministic Turn Resolution
-        turn = self.resolve_target_turn(
-            conversation_id=conversation_id,
-            explicit_turn_id=target_turn_id,
-            reply_to_message_id=reply_to_message_id,
-        )
+        if is_new_task:
+            turn = self.create_new_turn(conversation_id)
+        else:
+            turn = self.resolve_target_turn(
+                conversation_id=conversation_id,
+                explicit_turn_id=target_turn_id,
+                reply_to_message_id=reply_to_message_id,
+            )
 
         # 3. Resolve Adapter and Capabilities
         adapter = self.coordinator.get_adapter(turn.bound_agent_id)

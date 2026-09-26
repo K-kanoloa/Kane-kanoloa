@@ -80,6 +80,17 @@ class AgentEventHandler(ABC):
         """Execution encountered an unrecoverable failure. Transitions Turn to 'failed'."""
         ...
 
+    @abstractmethod
+    async def emit_boundary_signal(
+        self,
+        turn_id: str,
+    ) -> None:
+        """
+        Signal from Adapter that the underlying agent has reached a native safe execution boundary.
+        Enables Kane to dequeue and feed any pending safe-boundary steer inputs without exposing Mailbox to the Agent.
+        """
+        ...
+
 
 class BaseAdapter(ABC):
     """
