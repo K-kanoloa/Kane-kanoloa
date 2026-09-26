@@ -11,7 +11,7 @@ Disciplines:
      - supports_cancel = True (verified via session/cancel notification)
      - supports_resume = True (verified via session/resume with cwd)
      - supports_stream = True (verified via session/update notifications)
-     - supports_approval = False (inbound request_permission -> waiting_user verified; full allow/deny response roundtrip pending)
+     - supports_approval = True (verified: session/request_permission -> waiting_user -> respond_permission roundtrip over ACP stdio)
      - supports_parallel_sessions = True (verified via multiple sessions on single connection)
      - max_parallel_sessions = None (not statically capped by adapter; bound by DSH/system resources)
      - steer_mode = 'native' (verified: session/steer extension submits steering to active native session mid-flight)
@@ -33,16 +33,30 @@ Disciplines:
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import json
 import logging
 import os
 import sys
-from typing import Any
+import time
+from typing import Any, Literal
 
-from ..domain.models import AgentCapabilities, Message, Turn
+from ..domain.models import AgentCapabilities, Message, Turn, current_iso
 from .base import AgentEventHandler, BaseAdapter
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PendingPermissionRequest:
+    request_id: str | int  # JSON-RPC request id from DSH ACP
+    session_id: str
+    turn_id: str | None
+    tool_call: dict[str, Any]
+    options: list[dict[str, Any]]
+    created_at: float
+    status: Literal["pending", "resolved", "cancelled", "expired", "failed"] = "pending"
+    decision: str | None = None
 
 
 class KanaloaAdapter(BaseAdapter):
@@ -87,6 +101,7 @@ class KanaloaAdapter(BaseAdapter):
         self._stderr_task: asyncio.Task[None] | None = None
         self._is_initialized = False
         self._lock = asyncio.Lock()
+        self._pending_permissions: dict[str, PendingPermissionRequest] = {}
 
         # Audit properties for testing & verification
         self.last_sent_payload: dict[str, Any] | None = None
@@ -98,7 +113,7 @@ class KanaloaAdapter(BaseAdapter):
         - supports_cancel = True (verified: session/cancel notification cancels in-flight prompt)
         - supports_resume = True (verified: session/resume restores session config & context)
         - supports_stream = True (verified: session/update delivers stream content blocks)
-        - supports_approval = False (inbound session/request_permission -> waiting_user verified; full allow/deny response roundtrip pending)
+        - supports_approval = True (verified: session/request_permission -> waiting_user -> respond_permission roundtrip over ACP stdio)
         - supports_parallel_sessions = True (verified: multiple sessions on single connection)
         - max_parallel_sessions = None (not statically capped by adapter; actual concurrency bound by DSH/system resources)
         - steer_mode = 'native' (verified: session/steer extension submits steering to active native session mid-flight)
@@ -108,7 +123,7 @@ class KanaloaAdapter(BaseAdapter):
             supports_stream=True,
             supports_resume=True,
             supports_cancel=True,
-            supports_approval=False,
+            supports_approval=True,
             supports_parallel_sessions=True,
             max_parallel_sessions=None,
             steer_mode="native",
@@ -279,17 +294,158 @@ class KanaloaAdapter(BaseAdapter):
             await self.event_handler.emit_event(turn_id, norm_event_type, tool_payload)
 
     async def _handle_permission_request(self, msg: dict[str, Any]) -> None:
-        """Handle permission request from ACP agent (e.g. file edit or command execution)."""
-        session_id = msg.get("params", {}).get("sessionId")
+        """Handle permission request from ACP agent (e.g. tool execution / sandbox escalation)."""
+        rpc_id = msg.get("id")
+        params = msg.get("params", {})
+        session_id = params.get("sessionId")
         turn_id = self._session_turns.get(session_id or "")
+
+        if rpc_id is not None and session_id:
+            perm_key = str(rpc_id)
+            self._pending_permissions[perm_key] = PendingPermissionRequest(
+                request_id=rpc_id,
+                session_id=session_id,
+                turn_id=turn_id,
+                tool_call=params.get("toolCall", {}),
+                options=params.get("options", []),
+                created_at=time.time(),
+                status="pending",
+            )
+            logger.info(
+                "KanaloaAdapter: recorded pending permission request %s for session %s (turn: %s)",
+                rpc_id,
+                session_id,
+                turn_id,
+            )
+
         if turn_id:
+            prompt_text = params.get("message")
+            if not prompt_text:
+                tool_call = params.get("toolCall", {})
+                tool_name = tool_call.get("toolName") or tool_call.get("name") or "Tool"
+                prompt_text = f"Permission required for {tool_name} (request_id: {rpc_id})"
             await self.event_handler.emit_waiting_user(
                 turn_id,
-                prompt=msg.get("params", {}).get("message", "Permission required"),
+                prompt=prompt_text,
             )
+
+    def get_pending_permission(self, request_id: str | int) -> PendingPermissionRequest | None:
+        """Retrieve a pending permission request by its exact request ID."""
+        return self._pending_permissions.get(str(request_id))
+
+    def list_pending_permissions(self, session_id: str | None = None) -> list[PendingPermissionRequest]:
+        """List active pending permission requests, optionally filtered by session ID."""
+        perms = [p for p in self._pending_permissions.values() if p.status == "pending"]
+        if session_id:
+            perms = [p for p in perms if p.session_id == session_id]
+        return perms
+
+    async def respond_permission(
+        self,
+        request_id: str | int,
+        decision: Literal["allow-once", "reject-once", "cancelled"] | str,
+        session_id: str | None = None,
+    ) -> None:
+        """
+        Respond to an inbound DSH session/request_permission RPC call.
+
+        Enforces:
+        - Strict binding: must specify the exact request_id from the original permission request.
+        - Session safety: if session_id is provided, asserts match to prevent cross-session crosstalk.
+        - Lifecycle safety: rejects unknown, already resolved, expired, or cancelled requests.
+        - Conformance: formats standard ACP SelectedPermissionOutcome or cancelled outcome.
+        - Turn resumption: transitions waiting_user turn back to running upon resolution.
+        """
+        perm_key = str(request_id)
+        perm = self._pending_permissions.get(perm_key)
+        if not perm:
+            raise ValueError(f"Unknown permission request '{request_id}'")
+
+        if perm.status != "pending":
+            raise ValueError(
+                f"Permission request '{request_id}' is already {perm.status} (cannot be resolved)"
+            )
+
+        if session_id is not None and perm.session_id != session_id:
+            raise ValueError(
+                f"Session mismatch for permission request '{request_id}': "
+                f"expected '{perm.session_id}', got '{session_id}'"
+            )
+
+        # Validate decision against allowed options or cancelled
+        valid_options = {
+            opt.get("optionId")
+            for opt in perm.options
+            if isinstance(opt, dict) and "optionId" in opt
+        }
+        if not valid_options:
+            valid_options = {"allow-once", "reject-once"}
+
+        if decision == "cancelled":
+            outcome: dict[str, Any] = {"outcome": "cancelled"}
+        elif decision in valid_options or decision in ("allow-once", "reject-once"):
+            outcome = {
+                "outcome": "selected",
+                "optionId": decision,
+            }
+        else:
+            raise ValueError(
+                f"Invalid permission decision '{decision}'. "
+                f"Valid options: {sorted(valid_options | {'cancelled'})}"
+            )
+
+        if not self._process or self._process.stdin is None or self._process.returncode is not None:
+            perm.status = "failed"
+            raise RuntimeError("ACP subprocess is not running")
+
+        # Format exact JSON-RPC 2.0 response to DSH ACP
+        resp_msg: dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "id": perm.request_id,
+            "result": {
+                "outcome": outcome,
+            },
+        }
+        data = json.dumps(resp_msg, ensure_ascii=False) + "\n"
+        self._process.stdin.write(data.encode("utf-8"))
+        await self._process.stdin.drain()
+
+        perm.status = "resolved"
+        perm.decision = decision
+        logger.info(
+            "KanaloaAdapter: sent permission response %s for request %s (session %s)",
+            decision,
+            perm.request_id,
+            perm.session_id,
+        )
+
+        # Resume Turn in Kane: transition waiting_user back to running
+        turn_id = perm.turn_id
+        if turn_id and hasattr(self.event_handler, "store"):
+            store = getattr(self.event_handler, "store")
+            turn = store.get_turn(turn_id)
+            if turn and turn.status == "waiting_user":
+                turn.status = "running"
+                turn.last_event_at = current_iso()
+                store.save_turn(turn)
+                await self.event_handler.emit_event(
+                    turn_id,
+                    "status_change",
+                    {
+                        "status": "running",
+                        "resumed_from": "permission_response",
+                        "permission_request_id": str(request_id),
+                        "decision": decision,
+                    },
+                )
 
     async def close(self) -> None:
         """Clean up active sessions and shutdown ACP process."""
+        # Expire any pending permissions
+        for p in self._pending_permissions.values():
+            if p.status == "pending":
+                p.status = "expired"
+
         # 1. Close active sessions gracefully
         for session_id in list(self._active_sessions):
             try:
@@ -477,6 +633,11 @@ class KanaloaAdapter(BaseAdapter):
         if not session_id:
             logger.warning("KanaloaAdapter: cancel requested but no native_session_ref on turn %s", turn.turn_id)
             return
+
+        # Cancel any pending permissions for this session
+        for p in self._pending_permissions.values():
+            if p.session_id == session_id and p.status == "pending":
+                p.status = "cancelled"
 
         await self._send_notification("session/cancel", {
             "sessionId": session_id,

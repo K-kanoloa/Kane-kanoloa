@@ -150,3 +150,12 @@ class BaseAdapter(ABC):
     ) -> None:
         """Resume an interrupted or waiting Turn."""
         ...
+
+    async def respond_permission(
+        self,
+        request_id: str | int,
+        decision: str,
+        session_id: str | None = None,
+    ) -> None:
+        """Respond to an inbound permission request. Subclasses supporting approval should implement this."""
+        raise NotImplementedError("This adapter does not support approval responses.")

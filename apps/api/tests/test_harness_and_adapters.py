@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 import pytest
 
@@ -577,7 +578,7 @@ async def test_kanaloa_adapter_capabilities_and_session_binding(harness_env):
     assert caps.supports_cancel is True
     assert caps.supports_stream is True
     assert caps.supports_resume is True
-    assert caps.supports_approval is False
+    assert caps.supports_approval is True
     assert caps.supports_parallel_sessions is True
     assert caps.max_parallel_sessions is None
     assert caps.steer_mode == "native"
@@ -1069,6 +1070,264 @@ async def test_kanaloa_native_steer_wire_protocol(harness_env):
 
     # 4. Zero cancellations occurred!
     assert len(mock_kanaloa.cancel_notifs) == 0
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_approval_roundtrip_allow_and_reject(harness_env):
+    """
+    Verify complete Approval bidirectional roundtrip over ACP:
+    1. DSH ACP sends session/request_permission with id=101
+    2. Turn transitions to waiting_user
+    3. User invokes respond_permission with 'allow-once'
+    4. Exact JSON-RPC response formatted per ACP spec written to stdio
+    5. Turn in store automatically resumes to 'running'
+    6. Repeated response to same request rejected (fail-closed)
+    7. Second request with 'reject-once' verified
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    kanaloa = MockWireKanaloaAdapter(event_handler=coord)
+    # Mock subprocess stdin
+    written_data: list[str] = []
+    mock_stdin = AsyncMock()
+    mock_stdin.write = MagicMock(side_effect=lambda b: written_data.append(b.decode("utf-8")))
+    mock_stdin.drain = AsyncMock()
+    mock_process = MagicMock()
+    mock_process.stdin = mock_stdin
+    mock_process.returncode = None
+    kanaloa._process = mock_process
+    kanaloa._is_initialized = True
+
+    conv = Conversation(conversation_id="c_appr", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(
+        turn_id="t_appr_1",
+        conversation_id="c_appr",
+        bound_agent_id="kanaloa",
+        native_session_ref="sess_appr_1",
+        status="running",
+    )
+    store.save_turn(turn)
+    kanaloa.bind_session("t_appr_1", "sess_appr_1")
+
+    # 1. DSH sends permission request 101 (e.g. bash file edit)
+    await kanaloa._handle_incoming_rpc({
+        "jsonrpc": "2.0",
+        "id": 101,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "sess_appr_1",
+            "toolCall": {"toolCallId": "call_edit_1", "toolName": "edit_file"},
+            "options": [
+                {"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
+                {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
+            ],
+            "message": "Allow edit to config.json?",
+        },
+    })
+
+    # Verify Turn transitioned to waiting_user
+    assert store.get_turn("t_appr_1").status == "waiting_user"
+    pending = kanaloa.get_pending_permission(101)
+    assert pending is not None
+    assert pending.session_id == "sess_appr_1"
+    assert pending.turn_id == "t_appr_1"
+    assert pending.status == "pending"
+
+    # 2. User responds with 'allow-once'
+    await kanaloa.respond_permission(101, "allow-once", session_id="sess_appr_1")
+
+    # Verify Turn transitioned back to running
+    assert store.get_turn("t_appr_1").status == "running"
+    assert pending.status == "resolved"
+    assert pending.decision == "allow-once"
+
+    # Verify exact JSON-RPC response format
+    assert len(written_data) == 1
+    resp_101 = json.loads(written_data[0].strip())
+    assert resp_101["jsonrpc"] == "2.0"
+    assert resp_101["id"] == 101
+    assert resp_101["result"]["outcome"] == {
+        "outcome": "selected",
+        "optionId": "allow-once",
+    }
+
+    # 3. Repeated response to resolved request must raise ValueError
+    with pytest.raises(ValueError, match="already resolved"):
+        await kanaloa.respond_permission(101, "allow-once")
+
+    # 4. Second permission request with 'reject-once'
+    await kanaloa._handle_incoming_rpc({
+        "jsonrpc": "2.0",
+        "id": 102,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "sess_appr_1",
+            "toolCall": {"toolCallId": "call_rm_1", "toolName": "delete_all"},
+            "options": [
+                {"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
+                {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
+            ],
+            "message": "Allow delete_all?",
+        },
+    })
+    assert store.get_turn("t_appr_1").status == "waiting_user"
+    await kanaloa.respond_permission(102, "reject-once", session_id="sess_appr_1")
+    assert store.get_turn("t_appr_1").status == "running"
+
+    resp_102 = json.loads(written_data[1].strip())
+    assert resp_102["id"] == 102
+    assert resp_102["result"]["outcome"] == {
+        "outcome": "selected",
+        "optionId": "reject-once",
+    }
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_approval_parallel_sessions_no_crosstalk(harness_env):
+    """
+    Verify multiple concurrent sessions handling permission requests:
+    - Session A (Turn A) and Session B (Turn B) receive distinct permission requests.
+    - Mismatched session response strictly fails.
+    - Correct responses routed strictly by request_id and session_id without crosstalk.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    kanaloa = MockWireKanaloaAdapter(event_handler=coord)
+    written_data: list[str] = []
+    mock_stdin = AsyncMock()
+    mock_stdin.write = MagicMock(side_effect=lambda b: written_data.append(b.decode("utf-8")))
+    mock_stdin.drain = AsyncMock()
+    mock_process = MagicMock()
+    mock_process.stdin = mock_stdin
+    mock_process.returncode = None
+    kanaloa._process = mock_process
+    kanaloa._is_initialized = True
+
+    # Setup 2 turns on separate sessions
+    for i in (1, 2):
+        conv = Conversation(conversation_id=f"c_p_{i}", bound_agent_id="kanaloa")
+        store.save_conversation(conv)
+        turn = Turn(
+            turn_id=f"t_p_{i}",
+            conversation_id=f"c_p_{i}",
+            bound_agent_id="kanaloa",
+            native_session_ref=f"sess_p_{i}",
+            status="running",
+        )
+        store.save_turn(turn)
+        kanaloa.bind_session(f"t_p_{i}", f"sess_p_{i}")
+
+    # Session 1 receives Req 201; Session 2 receives Req 202
+    await kanaloa._handle_incoming_rpc({
+        "jsonrpc": "2.0",
+        "id": 201,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "sess_p_1",
+            "toolCall": {"toolCallId": "c_1", "toolName": "bash"},
+            "options": [{"optionId": "allow-once"}, {"optionId": "reject-once"}],
+        },
+    })
+    await kanaloa._handle_incoming_rpc({
+        "jsonrpc": "2.0",
+        "id": 202,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "sess_p_2",
+            "toolCall": {"toolCallId": "c_2", "toolName": "deploy"},
+            "options": [{"optionId": "allow-once"}, {"optionId": "reject-once"}],
+        },
+    })
+
+    assert store.get_turn("t_p_1").status == "waiting_user"
+    assert store.get_turn("t_p_2").status == "waiting_user"
+
+    # Cross-session injection attempt: Trying to answer Req 201 using sess_p_2 -> must fail
+    with pytest.raises(ValueError, match="Session mismatch"):
+        await kanaloa.respond_permission(201, "allow-once", session_id="sess_p_2")
+
+    # Correct response for Req 201 on Session 1
+    await kanaloa.respond_permission(201, "allow-once", session_id="sess_p_1")
+    assert store.get_turn("t_p_1").status == "running"
+    assert store.get_turn("t_p_2").status == "waiting_user"  # Session 2 still waiting!
+
+    # Correct response for Req 202 on Session 2
+    await kanaloa.respond_permission(202, "reject-once", session_id="sess_p_2")
+    assert store.get_turn("t_p_2").status == "running"
+
+    resp1 = json.loads(written_data[0].strip())
+    resp2 = json.loads(written_data[1].strip())
+    assert resp1["id"] == 201 and resp1["result"]["outcome"]["optionId"] == "allow-once"
+    assert resp2["id"] == 202 and resp2["result"]["outcome"]["optionId"] == "reject-once"
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_approval_expired_and_unknown_requests(harness_env):
+    """
+    Verify rejection of invalid, expired, cancelled, or unknown permission requests.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    kanaloa = MockWireKanaloaAdapter(event_handler=coord)
+    mock_process = MagicMock()
+    mock_process.stdin = AsyncMock()
+    mock_process.returncode = None
+    kanaloa._process = mock_process
+    kanaloa._is_initialized = True
+
+    # 1. Unknown request ID raises ValueError
+    with pytest.raises(ValueError, match="Unknown permission request '999'"):
+        await kanaloa.respond_permission(999, "allow-once")
+
+    # 2. Setup turn and request
+    conv = Conversation(conversation_id="c_exp", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(
+        turn_id="t_exp",
+        conversation_id="c_exp",
+        bound_agent_id="kanaloa",
+        native_session_ref="sess_exp",
+        status="running",
+    )
+    store.save_turn(turn)
+    kanaloa.bind_session("t_exp", "sess_exp")
+
+    await kanaloa._handle_incoming_rpc({
+        "jsonrpc": "2.0",
+        "id": 301,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "sess_exp",
+            "toolCall": {"toolCallId": "c_3", "toolName": "bash"},
+        },
+    })
+
+    # 3. Cancel turn -> marks pending permission cancelled
+    await kanaloa.cancel(turn)
+    assert kanaloa.get_pending_permission(301).status == "cancelled"
+
+    with pytest.raises(ValueError, match="already cancelled"):
+        await kanaloa.respond_permission(301, "allow-once")
+
+    # 4. Another request, then close adapter -> marks pending permission expired
+    await kanaloa._handle_incoming_rpc({
+        "jsonrpc": "2.0",
+        "id": 302,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "sess_exp",
+            "toolCall": {"toolCallId": "c_4", "toolName": "bash"},
+        },
+    })
+    await kanaloa.close()
+    assert kanaloa.get_pending_permission(302).status == "expired"
+
+    with pytest.raises(ValueError, match="already expired"):
+        await kanaloa.respond_permission(302, "allow-once")
 
 
 
