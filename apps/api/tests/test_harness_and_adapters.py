@@ -577,7 +577,7 @@ async def test_kanaloa_adapter_capabilities_and_session_binding(harness_env):
     assert caps.supports_cancel is True
     assert caps.supports_stream is True
     assert caps.supports_resume is True
-    assert caps.supports_approval is True
+    assert caps.supports_approval is False
     assert caps.supports_parallel_sessions is True
     assert caps.max_parallel_sessions is None
     assert caps.steer_mode == "follow_up_only"

@@ -11,9 +11,9 @@ Disciplines:
      - supports_cancel = True (verified via session/cancel notification)
      - supports_resume = True (verified via session/resume with cwd)
      - supports_stream = True (verified via session/update notifications)
-     - supports_approval = True (verified via session/request_permission protocol)
+     - supports_approval = False (inbound request_permission -> waiting_user verified; full allow/deny response roundtrip pending)
      - supports_parallel_sessions = True (verified via multiple sessions on single connection)
-     - max_parallel_sessions = None (unlimited on single connection)
+     - max_parallel_sessions = None (not statically capped by adapter; bound by DSH/system resources)
      - steer_mode = 'follow_up_only' (verified: ACP rejects mid-flight prompt with 'already in flight')
      - branch_mode = 'unsupported'
   4. Two-state Prompt semantics with Non-Negotiable Side-Effect Boundary:
@@ -83,9 +83,9 @@ class KanaloaAdapter(BaseAdapter):
         - supports_cancel = True (verified: session/cancel notification cancels in-flight prompt)
         - supports_resume = True (verified: session/resume restores session config & context)
         - supports_stream = True (verified: session/update delivers stream content blocks)
-        - supports_approval = True (verified: session/request_permission protocol)
+        - supports_approval = False (inbound session/request_permission -> waiting_user verified; full allow/deny response roundtrip pending)
         - supports_parallel_sessions = True (verified: multiple sessions on single connection)
-        - max_parallel_sessions = None (unlimited on single connection)
+        - max_parallel_sessions = None (not statically capped by adapter; actual concurrency bound by DSH/system resources)
         - steer_mode = 'follow_up_only' (verified: ACP rejects mid-flight prompt with 'already in flight')
         - branch_mode = 'unsupported'
         """
@@ -93,7 +93,7 @@ class KanaloaAdapter(BaseAdapter):
             supports_stream=True,
             supports_resume=True,
             supports_cancel=True,
-            supports_approval=True,
+            supports_approval=False,
             supports_parallel_sessions=True,
             max_parallel_sessions=None,
             steer_mode="follow_up_only",
