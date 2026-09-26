@@ -1,0 +1,417 @@
+"""SQLiteStore: v0.1 default implementation of BaseStore for Kane vNext."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from pathlib import Path
+
+from .base import BaseStore
+from ..domain.models import (
+    AgentBinding,
+    AgentCapabilities,
+    Conversation,
+    Message,
+    Turn,
+    TurnEvent,
+)
+
+
+class SQLiteStore(BaseStore):
+    """
+    SQLite-backed store implementing the BaseStore interface.
+    Thread-safe connection handling with WAL mode enabled.
+    """
+
+    def __init__(self, db_path: str | Path = ":memory:"):
+        self.db_path = str(db_path)
+        self._local = threading.local()
+        self._init_db()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            conn = sqlite3.connect(
+                self.db_path,
+                check_same_thread=False,
+                timeout=30.0,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA foreign_keys = ON;")
+            self._local.conn = conn
+        return self._local.conn
+
+    def close(self) -> None:
+        """Close thread-local database connection."""
+        if hasattr(self._local, "conn") and self._local.conn is not None:
+            self._local.conn.close()
+            self._local.conn = None
+
+    def _init_db(self) -> None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversations (
+                    conversation_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    bound_agent_id TEXT NOT NULL,
+                    focus_turn_id TEXT,
+                    branch_point_message_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    message_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    sender TEXT NOT NULL,
+                    sender_id TEXT,
+                    reply_to TEXT,
+                    parent_id TEXT,
+                    content TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    target_message_id TEXT,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_messages_conversation_id
+                ON messages (conversation_id, created_at);
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS turns (
+                    turn_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    bound_agent_id TEXT NOT NULL,
+                    title TEXT,
+                    status TEXT NOT NULL,
+                    native_session_ref TEXT,
+                    last_event_at TEXT NOT NULL,
+                    interrupt_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_turns_conversation_id
+                ON turns (conversation_id, created_at);
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS turn_events (
+                    event_id TEXT PRIMARY KEY,
+                    turn_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_turn_events_turn_id
+                ON turn_events (turn_id, created_at);
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_bindings (
+                    agent_id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    adapter_name TEXT NOT NULL,
+                    capabilities TEXT NOT NULL,
+                    config TEXT NOT NULL,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+
+    # --- Conversation Operations ---
+    def save_conversation(self, conversation: Conversation) -> None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO conversations (
+                    conversation_id, title, bound_agent_id, focus_turn_id,
+                    branch_point_message_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                    title = excluded.title,
+                    bound_agent_id = excluded.bound_agent_id,
+                    focus_turn_id = excluded.focus_turn_id,
+                    branch_point_message_id = excluded.branch_point_message_id,
+                    updated_at = excluded.updated_at;
+                """,
+                (
+                    conversation.conversation_id,
+                    conversation.title,
+                    conversation.bound_agent_id,
+                    conversation.focus_turn_id,
+                    conversation.branch_point_message_id,
+                    conversation.created_at,
+                    conversation.updated_at,
+                ),
+            )
+
+    def get_conversation(self, conversation_id: str) -> Conversation | None:
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM conversations WHERE conversation_id = ?;",
+            (conversation_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return Conversation(**dict(row))
+
+    def list_conversations(self) -> list[Conversation]:
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT * FROM conversations ORDER BY updated_at DESC;"
+        ).fetchall()
+        return [Conversation(**dict(r)) for r in rows]
+
+    # --- Message Operations (Append-Only) ---
+    def append_message(self, message: Message) -> None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO messages (
+                    message_id, conversation_id, sender, sender_id, reply_to,
+                    parent_id, content, kind, target_message_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    message.message_id,
+                    message.conversation_id,
+                    message.sender,
+                    message.sender_id,
+                    message.reply_to,
+                    message.parent_id,
+                    message.content,
+                    message.kind,
+                    message.target_message_id,
+                    message.created_at,
+                ),
+            )
+
+    def get_messages(
+        self,
+        conversation_id: str,
+        up_to_message_id: str | None = None,
+    ) -> list[Message]:
+        conn = self._get_connection()
+        if up_to_message_id:
+            # Check if parent_id lineage is present
+            target = conn.execute(
+                "SELECT * FROM messages WHERE message_id = ? AND conversation_id = ?;",
+                (up_to_message_id, conversation_id),
+            ).fetchone()
+            if not target:
+                return []
+
+            # Lineage walk backwards via parent_id if linked
+            lineage: list[Message] = []
+            curr_id: str | None = up_to_message_id
+            visited: set[str] = set()
+
+            while curr_id and curr_id not in visited:
+                visited.add(curr_id)
+                row = conn.execute(
+                    "SELECT * FROM messages WHERE message_id = ?;",
+                    (curr_id,),
+                ).fetchone()
+                if not row:
+                    break
+                msg = Message(**dict(row))
+                lineage.append(msg)
+                curr_id = msg.parent_id
+
+            if len(lineage) > 1 or target["parent_id"] is not None:
+                lineage.reverse()
+                return lineage
+
+            # Fallback: slice by created_at boundary
+            rows = conn.execute(
+                """
+                SELECT * FROM messages
+                WHERE conversation_id = ? AND created_at <= ?
+                ORDER BY created_at ASC;
+                """,
+                (conversation_id, target["created_at"]),
+            ).fetchall()
+            return [Message(**dict(r)) for r in rows]
+
+        # Normal full history for conversation
+        rows = conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE conversation_id = ?
+            ORDER BY created_at ASC;
+            """,
+            (conversation_id,),
+        ).fetchall()
+        return [Message(**dict(r)) for r in rows]
+
+    # --- Turn Operations ---
+    def save_turn(self, turn: Turn) -> None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO turns (
+                    turn_id, conversation_id, bound_agent_id, title, status,
+                    native_session_ref, last_event_at, interrupt_reason,
+                    created_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(turn_id) DO UPDATE SET
+                    title = excluded.title,
+                    status = excluded.status,
+                    native_session_ref = excluded.native_session_ref,
+                    last_event_at = excluded.last_event_at,
+                    interrupt_reason = excluded.interrupt_reason,
+                    finished_at = excluded.finished_at;
+                """,
+                (
+                    turn.turn_id,
+                    turn.conversation_id,
+                    turn.bound_agent_id,
+                    turn.title,
+                    turn.status,
+                    turn.native_session_ref,
+                    turn.last_event_at,
+                    turn.interrupt_reason,
+                    turn.created_at,
+                    turn.finished_at,
+                ),
+            )
+
+    def get_turn(self, turn_id: str) -> Turn | None:
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM turns WHERE turn_id = ?;",
+            (turn_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return Turn(**dict(row))
+
+    def list_turns(self, conversation_id: str) -> list[Turn]:
+        conn = self._get_connection()
+        rows = conn.execute(
+            """
+            SELECT * FROM turns
+            WHERE conversation_id = ?
+            ORDER BY created_at ASC;
+            """,
+            (conversation_id,),
+        ).fetchall()
+        return [Turn(**dict(r)) for r in rows]
+
+    # --- Turn Event Operations ---
+    def append_event(self, event: TurnEvent) -> None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO turn_events (
+                    event_id, turn_id, conversation_id, event_type, payload, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    event.event_id,
+                    event.turn_id,
+                    event.conversation_id,
+                    event.event_type,
+                    json.dumps(event.payload, ensure_ascii=False),
+                    event.created_at,
+                ),
+            )
+
+    def list_events(self, turn_id: str) -> list[TurnEvent]:
+        conn = self._get_connection()
+        rows = conn.execute(
+            """
+            SELECT * FROM turn_events
+            WHERE turn_id = ?
+            ORDER BY created_at ASC;
+            """,
+            (turn_id,),
+        ).fetchall()
+        events: list[TurnEvent] = []
+        for r in rows:
+            data = dict(r)
+            data["payload"] = json.loads(data["payload"])
+            events.append(TurnEvent(**data))
+        return events
+
+    # --- Agent Binding Operations ---
+    def save_agent_binding(self, binding: AgentBinding) -> None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO agent_bindings (
+                    agent_id, display_name, adapter_name, capabilities,
+                    config, is_active, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(agent_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    adapter_name = excluded.adapter_name,
+                    capabilities = excluded.capabilities,
+                    config = excluded.config,
+                    is_active = excluded.is_active;
+                """,
+                (
+                    binding.agent_id,
+                    binding.display_name,
+                    binding.adapter_name,
+                    binding.capabilities.model_dump_json(),
+                    json.dumps(binding.config, ensure_ascii=False),
+                    1 if binding.is_active else 0,
+                    binding.created_at,
+                ),
+            )
+
+    def get_agent_binding(self, agent_id: str) -> AgentBinding | None:
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM agent_bindings WHERE agent_id = ?;",
+            (agent_id,),
+        ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        data["capabilities"] = AgentCapabilities.model_validate_json(data["capabilities"])
+        data["config"] = json.loads(data["config"])
+        data["is_active"] = bool(data["is_active"])
+        return AgentBinding(**data)
+
+    def list_agent_bindings(self) -> list[AgentBinding]:
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT * FROM agent_bindings ORDER BY agent_id ASC;"
+        ).fetchall()
+        bindings: list[AgentBinding] = []
+        for r in rows:
+            data = dict(r)
+            data["capabilities"] = AgentCapabilities.model_validate_json(data["capabilities"])
+            data["config"] = json.loads(data["config"])
+            data["is_active"] = bool(data["is_active"])
+            bindings.append(AgentBinding(**data))
+        return bindings
