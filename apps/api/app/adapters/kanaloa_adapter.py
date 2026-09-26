@@ -121,7 +121,7 @@ class KanaloaAdapter(BaseAdapter):
         - supports_parallel_sessions = True (verified: multiple sessions on single connection)
         - max_parallel_sessions = None (not statically capped by adapter; actual concurrency bound by DSH/system resources)
         - steer_mode = 'native' (verified: session/steer extension submits steering to active native session mid-flight)
-        - branch_mode = 'unsupported'
+        - branch_mode = 'replay' (verified: creates new isolated native session with historical transcript as passive context without re-executing side-effects)
         """
         return AgentCapabilities(
             supports_stream=True,
@@ -131,7 +131,7 @@ class KanaloaAdapter(BaseAdapter):
             supports_parallel_sessions=True,
             max_parallel_sessions=None,
             steer_mode="native",
-            branch_mode="unsupported",
+            branch_mode="replay",
         )
 
     # --- Session Binding ---
@@ -766,3 +766,31 @@ class KanaloaAdapter(BaseAdapter):
 
         self._active_sessions.add(session_id)
         logger.info("KanaloaAdapter: resumed session %s successfully", session_id)
+
+    async def probe_session(self, native_session_ref: str | None) -> bool:
+        """
+        Probe native session / process / transport truth for startup reconciliation (§30).
+        1. Physical process check: if process is dead or uninitialized, return False immediately.
+        2. If native_session_ref is active in memory, return True.
+        3. If process is alive and supports_resume, verify if session/resume succeeds with DSH ACP.
+        4. Otherwise return False.
+        Never relies on timeouts or guessing.
+        """
+        if not native_session_ref:
+            return False
+        if not self.is_alive():
+            return False
+        if native_session_ref in self._active_sessions:
+            return True
+        if self.capabilities().supports_resume:
+            try:
+                resp = await self._send_request("session/resume", {
+                    "sessionId": native_session_ref,
+                    "cwd": self.cwd,
+                })
+                if "error" not in resp:
+                    self._active_sessions.add(native_session_ref)
+                    return True
+            except Exception:
+                return False
+        return False

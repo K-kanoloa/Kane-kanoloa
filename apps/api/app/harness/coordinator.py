@@ -301,3 +301,34 @@ class HarnessCoordinator(AgentEventHandler):
             )
             self.store.append_event(boundary_event)
             self._broadcast_event(boundary_event)
+
+    async def reconcile_startup_turns(self) -> dict[str, str]:
+        """
+        Startup Reconciliation Pass (§30):
+        Scans all turns where persisted status == 'running'.
+        Queries corresponding adapter's probe_session truth:
+        - If recoverable: remain 'running'.
+        - If unrecoverable (process exited, lost session, resume failed, no adapter):
+          transition to 'interrupted' with reason='unrecoverable:session_lost_on_startup'.
+          Strictly preserves partial_output, DOES NOT rerun prompt, DOES NOT create replacement session.
+        - waiting_user turns remain waiting_user; stale permissions fail-closed (§34).
+        - Terminal turns (finished, failed, interrupted) remain unchanged.
+        Returns a dict of turn_id -> new_or_confirmed_status.
+        """
+        running_turns = self.store.list_running_turns()
+        results: dict[str, str] = {}
+        for turn in running_turns:
+            agent_id = turn.bound_agent_id
+            if not self.has_adapter(agent_id):
+                await self.emit_interrupted(turn.turn_id, reason="unrecoverable:no_adapter_available")
+                results[turn.turn_id] = "interrupted"
+                continue
+
+            adapter = self.get_adapter(agent_id)
+            is_live = await adapter.probe_session(turn.native_session_ref)
+            if is_live:
+                results[turn.turn_id] = "running"
+            else:
+                await self.emit_interrupted(turn.turn_id, reason="unrecoverable:session_lost_on_startup")
+                results[turn.turn_id] = "interrupted"
+        return results

@@ -118,6 +118,95 @@ class Dispatcher:
             f"Please specify an explicit target_turn_id or request a new turn."
         )
 
+    def set_focus_turn(self, conversation_id: str, turn_id: str) -> Turn:
+        """
+        Explicitly set a turn as the focus turn of a conversation (§11, §14).
+        Only updates conv.focus_turn_id when the user explicitly chooses it.
+        """
+        turn = self.store.get_turn(turn_id)
+        if not turn:
+            raise ValueError(f"Turn '{turn_id}' not found")
+        if turn.conversation_id != conversation_id:
+            raise ValueError(f"Turn '{turn_id}' does not belong to conversation '{conversation_id}'")
+        conv = self.store.get_conversation(conversation_id)
+        if not conv:
+            raise ValueError(f"Conversation '{conversation_id}' not found")
+        conv.focus_turn_id = turn_id
+        conv.updated_at = current_iso()
+        self.store.save_conversation(conv)
+        return turn
+
+    def branch_from_message(
+        self,
+        conversation_id: str,
+        message_id: str,
+        title: str | None = None,
+    ) -> Turn:
+        """
+        Explicitly create a new Branch path inside the same Conversation (§16, §17, §40).
+        - Verifies message_id belongs to conversation_id.
+        - Establishes a new history boundary ending at message_id.
+        - Creates a new isolated Turn with branch_point_message_id = message_id.
+        - Does NOT create a new Conversation object (maintains same conversation_id).
+        - Does NOT rewrite or delete any historical messages.
+        """
+        conv = self.store.get_conversation(conversation_id)
+        if not conv:
+            raise ValueError(f"Conversation '{conversation_id}' not found")
+
+        msg = self.store.get_message(message_id)
+        if not msg:
+            raise ValueError(f"Message '{message_id}' not found")
+        if msg.conversation_id != conversation_id:
+            raise ValueError(
+                f"Message '{message_id}' belongs to conversation '{msg.conversation_id}', not '{conversation_id}'"
+            )
+
+        branch_turn = Turn(
+            conversation_id=conversation_id,
+            bound_agent_id=conv.bound_agent_id,
+            status="running",
+            title=title or f"Branch from {message_id}",
+            branch_point_message_id=message_id,
+        )
+        self.store.save_turn(branch_turn)
+        return branch_turn
+
+    def get_turn_history(self, turn: Turn) -> list[Message]:
+        """
+        Compute the visible historical messages for a Turn (§16, §17, §40):
+        - If Turn is a Branch (turn.branch_point_message_id is set):
+          Visible history = [lineage up to branch_point_message_id] + [prior messages of this branch turn].
+          Never sees main messages created after the branch point.
+        - If Turn is on the Main branch (turn.branch_point_message_id is None):
+          Visible history = all messages in conversation EXCLUDING messages from branch turns.
+          Never sees branch messages.
+        """
+        conversation_id = turn.conversation_id
+        all_conv_messages = self.store.get_messages(conversation_id)
+
+        if turn.branch_point_message_id:
+            # 1. Base historical lineage up to branch point
+            base_history = self.store.get_messages(
+                conversation_id,
+                up_to_message_id=turn.branch_point_message_id,
+            )
+            base_ids = {m.message_id for m in base_history}
+
+            # 2. Add prior messages belonging strictly to this branch turn
+            branch_turn_msgs = [
+                m for m in all_conv_messages
+                if m.turn_id == turn.turn_id and m.message_id not in base_ids
+            ]
+            return base_history + branch_turn_msgs
+        else:
+            # Main lineage: exclude messages belonging to branch turns
+            all_turns = self.store.list_turns(conversation_id)
+            branch_turn_ids = {
+                t.turn_id for t in all_turns if t.branch_point_message_id is not None
+            }
+            return [m for m in all_conv_messages if m.turn_id not in branch_turn_ids]
+
     def create_new_turn(self, conversation_id: str, title: str | None = None) -> Turn:
         """
         Explicitly create an additional independent Turn for a conversation (New Turn).
@@ -165,13 +254,22 @@ class Dispatcher:
                 reply_to_message_id=reply_to_message_id,
             )
 
+        # Resolve effective parent_id for branch lineage
+        effective_parent_id = parent_id
+        if effective_parent_id is None and turn.branch_point_message_id:
+            turn_msgs = [m for m in self.store.get_messages(conversation_id) if m.turn_id == turn.turn_id]
+            if turn_msgs:
+                effective_parent_id = turn_msgs[-1].message_id
+            else:
+                effective_parent_id = turn.branch_point_message_id
+
         # 2. Append User Message with explicit turn_id
         user_msg = Message(
             conversation_id=conversation_id,
             turn_id=turn.turn_id,
             sender="user",
             reply_to=reply_to_message_id,
-            parent_id=parent_id,
+            parent_id=effective_parent_id,
             content=content,
         )
         self.store.append_message(user_msg)
@@ -189,7 +287,7 @@ class Dispatcher:
             turn.last_event_at = current_iso()
             self.store.save_turn(turn)
 
-            history = self.store.get_messages(conversation_id)
+            history = [m for m in self.get_turn_history(turn) if m.message_id != user_msg.message_id]
             await adapter.send(turn, user_msg, history)
 
         elif turn.status == "waiting_user":
@@ -198,38 +296,51 @@ class Dispatcher:
             turn.last_event_at = current_iso()
             self.store.save_turn(turn)
 
-            history = self.store.get_messages(conversation_id)
+            history = [m for m in self.get_turn_history(turn) if m.message_id != user_msg.message_id]
             await adapter.send(turn, user_msg, history)
 
         elif turn.status == "running":
-            # Turn is actively running -> Steer Degradation
-            steer_mode = caps.steer_mode
-            if steer_mode == "native":
-                await adapter.steer(turn, user_msg)
-            elif steer_mode == "safe_boundary":
-                mailbox = self.mailbox_manager.get_mailbox(turn.turn_id)
-                await mailbox.put(
-                    MailboxItem(
-                        turn_id=turn.turn_id,
-                        item_type="steer",
-                        payload={
-                            "message_id": user_msg.message_id,
-                            "content": user_msg.content,
-                        },
+            # If the adapter manages native sessions and no native session has been established yet for this turn
+            # (e.g. initial message for a brand new turn or a newly created branch turn),
+            # this message is the turn's initial bootstrap send, not a mid-flight steer.
+            needs_initial_send = False
+            if hasattr(adapter, "get_native_session"):
+                native_sess = turn.native_session_ref or adapter.get_native_session(turn.turn_id)
+                if not native_sess:
+                    needs_initial_send = True
+
+            if needs_initial_send:
+                history = [m for m in self.get_turn_history(turn) if m.message_id != user_msg.message_id]
+                await adapter.send(turn, user_msg, history)
+            else:
+                # Turn is actively running -> Steer Degradation
+                steer_mode = caps.steer_mode
+                if steer_mode == "native":
+                    await adapter.steer(turn, user_msg)
+                elif steer_mode == "safe_boundary":
+                    mailbox = self.mailbox_manager.get_mailbox(turn.turn_id)
+                    await mailbox.put(
+                        MailboxItem(
+                            turn_id=turn.turn_id,
+                            item_type="steer",
+                            payload={
+                                "message_id": user_msg.message_id,
+                                "content": user_msg.content,
+                            },
+                        )
                     )
-                )
-            elif steer_mode == "follow_up_only":
-                mailbox = self.mailbox_manager.get_mailbox(turn.turn_id)
-                await mailbox.put(
-                    MailboxItem(
-                        turn_id=turn.turn_id,
-                        item_type="message",
-                        payload={
-                            "message_id": user_msg.message_id,
-                            "content": user_msg.content,
-                        },
+                elif steer_mode == "follow_up_only":
+                    mailbox = self.mailbox_manager.get_mailbox(turn.turn_id)
+                    await mailbox.put(
+                        MailboxItem(
+                            turn_id=turn.turn_id,
+                            item_type="message",
+                            payload={
+                                "message_id": user_msg.message_id,
+                                "content": user_msg.content,
+                            },
+                        )
                     )
-                )
 
         return user_msg, turn
 
@@ -242,7 +353,7 @@ class Dispatcher:
         turn.last_event_at = current_iso()
         self.store.save_turn(turn)
 
-        history = self.store.get_messages(turn.conversation_id)
+        history = [m for m in self.get_turn_history(turn) if m.message_id != followup_msg.message_id]
         await adapter.send(turn, followup_msg, history)
 
     async def cancel_turn(self, turn_id: str, reason: str = "cancelled_by_user") -> Turn:
@@ -280,6 +391,6 @@ class Dispatcher:
         turn.last_event_at = current_iso()
         self.store.save_turn(turn)
 
-        history = self.store.get_messages(turn.conversation_id)
+        history = self.get_turn_history(turn)
         await adapter.resume(turn, history)
         return self.store.get_turn(turn_id)

@@ -159,3 +159,12 @@ class BaseAdapter(ABC):
     ) -> None:
         """Respond to an inbound permission request. Subclasses supporting approval should implement this."""
         raise NotImplementedError("This adapter does not support approval responses.")
+
+    async def probe_session(self, native_session_ref: str | None) -> bool:
+        """
+        Thinnest physical liveness/recovery probe (§30).
+        Probes whether the native session / process / transport is alive and recoverable.
+        Returns True if alive and recoverable, False if lost or dead.
+        Must NEVER rely on timeout or guessing.
+        """
+        return False

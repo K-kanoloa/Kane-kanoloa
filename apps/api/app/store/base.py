@@ -85,6 +85,11 @@ class BaseStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def list_running_turns(self) -> list[Turn]:
+        """List all turns currently in 'running' status across all conversations (for startup reconciliation)."""
+        raise NotImplementedError
+
+    @abstractmethod
     def finalize_turn_completion(
         self,
         turn: Turn,

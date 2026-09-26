@@ -582,7 +582,7 @@ async def test_kanaloa_adapter_capabilities_and_session_binding(harness_env):
     assert caps.supports_parallel_sessions is True
     assert caps.max_parallel_sessions is None
     assert caps.steer_mode == "native"
-    assert caps.branch_mode == "unsupported"
+    assert caps.branch_mode == "replay"
 
     # Session binding
     conv = Conversation(conversation_id="c_kan", bound_agent_id="kanaloa")

@@ -60,6 +60,7 @@ class Turn(BaseModel):
     title: str | None = None
     status: TurnStatus = "running"
     native_session_ref: str | None = None
+    branch_point_message_id: str | None = None  # None = main lineage; set if Turn represents a branch (§16, §39)
     last_event_at: str = Field(default_factory=current_iso)
     interrupt_reason: str | None = None
     partial_output: str | None = None  # Survives across restart in Turn buffer (§31)

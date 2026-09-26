@@ -34,6 +34,7 @@ class MockAdapter(BaseAdapter):
         self.steer_calls: list[dict[str, Any]] = []
         self.cancel_calls: list[dict[str, Any]] = []
         self.resume_calls: list[dict[str, Any]] = []
+        self.live_sessions: set[str] = set()
 
         # Hook for custom execution simulation
         self.on_send_behavior: Any = None
@@ -124,3 +125,8 @@ class MockAdapter(BaseAdapter):
     async def simulate_reach_safe_boundary(self, turn_id: str) -> None:
         """Simulate reaching a native execution boundary and signaling Kane."""
         await self.event_handler.emit_boundary_signal(turn_id)
+
+    async def probe_session(self, native_session_ref: str | None) -> bool:
+        if not native_session_ref:
+            return False
+        return native_session_ref in self.live_sessions

@@ -102,6 +102,7 @@ class SQLiteStore(BaseStore):
                     title TEXT,
                     status TEXT NOT NULL,
                     native_session_ref TEXT,
+                    branch_point_message_id TEXT,
                     last_event_at TEXT NOT NULL,
                     interrupt_reason TEXT,
                     partial_output TEXT,
@@ -153,6 +154,8 @@ class SQLiteStore(BaseStore):
             existing_columns = {row["name"] for row in cursor.fetchall()}
             if "partial_output" not in existing_columns:
                 conn.execute("ALTER TABLE turns ADD COLUMN partial_output TEXT;")
+            if "branch_point_message_id" not in existing_columns:
+                conn.execute("ALTER TABLE turns ADD COLUMN branch_point_message_id TEXT;")
 
             cursor_msg = conn.execute("PRAGMA table_info(messages);")
             existing_msg_cols = {row["name"] for row in cursor_msg.fetchall()}
@@ -240,7 +243,7 @@ class SQLiteStore(BaseStore):
         if up_to_message_id:
             # Check if parent_id lineage is present
             target = conn.execute(
-                "SELECT * FROM messages WHERE message_id = ? AND conversation_id = ?;",
+                "SELECT rowid, * FROM messages WHERE message_id = ? AND conversation_id = ?;",
                 (up_to_message_id, conversation_id),
             ).fetchone()
             if not target:
@@ -254,12 +257,14 @@ class SQLiteStore(BaseStore):
             while curr_id and curr_id not in visited:
                 visited.add(curr_id)
                 row = conn.execute(
-                    "SELECT * FROM messages WHERE message_id = ?;",
+                    "SELECT rowid, * FROM messages WHERE message_id = ?;",
                     (curr_id,),
                 ).fetchone()
                 if not row:
                     break
-                msg = Message(**dict(row))
+                row_dict = dict(row)
+                row_dict.pop("rowid", None)
+                msg = Message(**row_dict)
                 lineage.append(msg)
                 curr_id = msg.parent_id
 
@@ -267,14 +272,14 @@ class SQLiteStore(BaseStore):
                 lineage.reverse()
                 return lineage
 
-            # Fallback: slice by created_at boundary
+            # Fallback: slice by rowid boundary (strict monotonic insertion order)
             rows = conn.execute(
                 """
                 SELECT * FROM messages
-                WHERE conversation_id = ? AND created_at <= ?
-                ORDER BY created_at ASC;
+                WHERE conversation_id = ? AND rowid <= ?
+                ORDER BY rowid ASC;
                 """,
-                (conversation_id, target["created_at"]),
+                (conversation_id, target["rowid"]),
             ).fetchall()
             return [Message(**dict(r)) for r in rows]
 
@@ -317,13 +322,14 @@ class SQLiteStore(BaseStore):
                 """
                 INSERT INTO turns (
                     turn_id, conversation_id, bound_agent_id, title, status,
-                    native_session_ref, last_event_at, interrupt_reason,
+                    native_session_ref, branch_point_message_id, last_event_at, interrupt_reason,
                     partial_output, created_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(turn_id) DO UPDATE SET
                     title = excluded.title,
                     status = excluded.status,
                     native_session_ref = excluded.native_session_ref,
+                    branch_point_message_id = excluded.branch_point_message_id,
                     last_event_at = excluded.last_event_at,
                     interrupt_reason = excluded.interrupt_reason,
                     partial_output = excluded.partial_output,
@@ -336,6 +342,7 @@ class SQLiteStore(BaseStore):
                     turn.title,
                     turn.status,
                     turn.native_session_ref,
+                    turn.branch_point_message_id,
                     turn.last_event_at,
                     turn.interrupt_reason,
                     turn.partial_output,
@@ -381,6 +388,18 @@ class SQLiteStore(BaseStore):
             ORDER BY created_at ASC;
             """,
             (conversation_id,),
+        ).fetchall()
+        return [Turn(**self._normalize_turn_data(dict(r))) for r in rows]
+
+    def list_running_turns(self) -> list[Turn]:
+        """List all turns currently in 'running' status across all conversations (for startup reconciliation)."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            """
+            SELECT * FROM turns
+            WHERE status = 'running'
+            ORDER BY created_at ASC;
+            """
         ).fetchall()
         return [Turn(**self._normalize_turn_data(dict(r))) for r in rows]
 
