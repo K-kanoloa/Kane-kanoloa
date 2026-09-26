@@ -97,6 +97,7 @@ class SQLiteStore(BaseStore):
                     native_session_ref TEXT,
                     last_event_at TEXT NOT NULL,
                     interrupt_reason TEXT,
+                    partial_output TEXT,
                     created_at TEXT NOT NULL,
                     finished_at TEXT
                 );
@@ -277,14 +278,15 @@ class SQLiteStore(BaseStore):
                 INSERT INTO turns (
                     turn_id, conversation_id, bound_agent_id, title, status,
                     native_session_ref, last_event_at, interrupt_reason,
-                    created_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    partial_output, created_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(turn_id) DO UPDATE SET
                     title = excluded.title,
                     status = excluded.status,
                     native_session_ref = excluded.native_session_ref,
                     last_event_at = excluded.last_event_at,
                     interrupt_reason = excluded.interrupt_reason,
+                    partial_output = excluded.partial_output,
                     finished_at = excluded.finished_at;
                 """,
                 (
@@ -296,6 +298,7 @@ class SQLiteStore(BaseStore):
                     turn.native_session_ref,
                     turn.last_event_at,
                     turn.interrupt_reason,
+                    turn.partial_output,
                     turn.created_at,
                     turn.finished_at,
                 ),

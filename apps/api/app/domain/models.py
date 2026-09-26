@@ -44,14 +44,14 @@ class Message(BaseModel):
 
 
 # --- Turn ---
-TurnStatus = Literal["running", "waiting_user", "finished", "interrupted"]
+TurnStatus = Literal["running", "waiting_user", "finished", "failed", "interrupted"]
 
 
 class Turn(BaseModel):
     """
     Turn represents an Agent's continuous lifecycle around a specific objective.
     A Turn can span minutes, hours, or days across multiple messages and steers.
-    No heavy state machine: only minimal runtime facts.
+    No heavy state machine: only minimal runtime facts (§8 & §39).
     """
     turn_id: str = Field(default_factory=lambda: new_id("turn"))
     conversation_id: str
@@ -61,6 +61,7 @@ class Turn(BaseModel):
     native_session_ref: str | None = None
     last_event_at: str = Field(default_factory=current_iso)
     interrupt_reason: str | None = None
+    partial_output: str | None = None  # Survives across restart in Turn buffer (§31)
     created_at: str = Field(default_factory=current_iso)
     finished_at: str | None = None
 

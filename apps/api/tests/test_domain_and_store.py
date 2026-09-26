@@ -127,6 +127,11 @@ def test_turn_lifecycle_and_facts():
     store.save_turn(t)
     assert store.get_turn("turn_test_1").status == "waiting_user"
 
+    # Stream buffer arrives and persists across restart in turn runtime buffer
+    t.partial_output = "Analysis part 1: Muse harness model..."
+    store.save_turn(t)
+    assert store.get_turn("turn_test_1").partial_output == "Analysis part 1: Muse harness model..."
+
     # Session lost / process exited
     t.status = "interrupted"
     t.interrupt_reason = "process_exited"
@@ -135,6 +140,17 @@ def test_turn_lifecycle_and_facts():
     interrupted = store.get_turn("turn_test_1")
     assert interrupted.status == "interrupted"
     assert interrupted.interrupt_reason == "process_exited"
+    assert interrupted.partial_output == "Analysis part 1: Muse harness model..."
+
+    # Explicit failure
+    t.status = "failed"
+    store.save_turn(t)
+    assert store.get_turn("turn_test_1").status == "failed"
+
+    # User follow-up can resume the same turn back to running (§8)
+    t.status = "running"
+    store.save_turn(t)
+    assert store.get_turn("turn_test_1").status == "running"
 
 
 def test_turn_events_isolation():
