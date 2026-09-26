@@ -1,5 +1,9 @@
 # Kane Agent Platform v2.0.0
 
+> [!NOTE]
+> **Development Branch Notice (`vnext/thin-harness`)**:
+> This branch represents the active Kane vNext Phase 1 development skeleton. The legacy v2 Agent OS business core has been pruned to a minimal health-only harness. The text below documents the frozen v2.0.0 release for reference.
+
 [Website](https://alvin20062006-beep.github.io/Kane-Agent-Platform/) |
 [Download ZIP](https://github.com/alvin20062006-beep/Kane-Agent-Platform/archive/refs/heads/main.zip) |
 [GitHub Release](https://github.com/alvin20062006-beep/Kane-Agent-Platform/releases/tag/v2.0.0)

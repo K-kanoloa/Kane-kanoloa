@@ -77,7 +77,7 @@ _SUPPORTED_ADAPTERS = [
 app = FastAPI(
     title="Kane Local Bridge",
     version="2.0.0",
-    description="Kane local execution adapter: POST /v1/execute (Claude CLI, Codex CLI, OpenClaw webhook, handoff files, local_script, Cursor handoff) + API callback.",
+    description="Kane Local Bridge service (vNext Phase 1 minimal skeleton). Preserves CLI diagnostics and path safety; legacy Task execution is deprecated and does not represent vNext Adapter.",
 )
 
 AGENTS: dict[str, AgentRegistration] = {}
@@ -276,7 +276,9 @@ def _status_payload() -> dict[str, Any]:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "kane-local-bridge", "version": BRIDGE_VERSION, **_adapter_probe_payload()}
+    probe = _adapter_probe_payload()
+    probe.pop("supported_adapters", None)
+    return {"status": "ok", "service": "kane-local-bridge", "version": BRIDGE_VERSION, **probe}
 
 
 @app.get("/v1/status")

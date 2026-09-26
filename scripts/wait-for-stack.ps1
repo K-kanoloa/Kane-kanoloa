@@ -8,14 +8,14 @@ $TimeoutSeconds = if ($env:E2E_WAIT_TIMEOUT_SECONDS) { [int]$env:E2E_WAIT_TIMEOU
 $Targets = @(
   @{ Name = "api"; Url = "$ApiBase/health" },
   @{ Name = "bridge"; Url = "$BridgeBase/health" },
-  @{ Name = "web"; Url = "$WebBase/conversations" }
+  @{ Name = "web"; Url = "$WebBase/" }
 )
 
 function Test-EndpointReady {
   param([string]$Url)
   try {
     $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 5
-    return ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500)
+    return ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300)
   } catch {
     return $false
   }
