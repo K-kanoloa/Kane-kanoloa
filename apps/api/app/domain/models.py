@@ -48,6 +48,20 @@ class Message(BaseModel):
 TurnStatus = Literal["running", "waiting_user", "finished", "failed", "interrupted"]
 
 
+# --- BranchBoundary (Store / Internal Metadata) ---
+class BranchBoundary(BaseModel):
+    """
+    Internal metadata for a conversation history worldline (§16, §17).
+    Branch = conversation history boundary.
+    Turn = work lifecycle within a branch.
+    """
+    branch_id: str = Field(default_factory=lambda: new_id("branch"))
+    conversation_id: str
+    branch_point_message_id: str | None = None  # None for the default 'main' branch
+    name: str | None = None
+    created_at: str = Field(default_factory=current_iso)
+
+
 class Turn(BaseModel):
     """
     Turn represents an Agent's continuous lifecycle around a specific objective.
@@ -57,10 +71,10 @@ class Turn(BaseModel):
     turn_id: str = Field(default_factory=lambda: new_id("turn"))
     conversation_id: str
     bound_agent_id: str
+    branch_id: str = "main"  # Which historical worldline this Turn operates on (§16, §17)
     title: str | None = None
     status: TurnStatus = "running"
     native_session_ref: str | None = None
-    branch_point_message_id: str | None = None  # None = main lineage; set if Turn represents a branch (§16, §39)
     last_event_at: str = Field(default_factory=current_iso)
     interrupt_reason: str | None = None
     partial_output: str | None = None  # Survives across restart in Turn buffer (§31)
@@ -97,13 +111,12 @@ class TurnEvent(BaseModel):
 # --- Conversation ---
 class Conversation(BaseModel):
     """
-    Long-lived chat container.
+    Long-lived chat container (§5.1).
     """
     conversation_id: str = Field(default_factory=lambda: new_id("conv"))
     title: str = "New Conversation"
     bound_agent_id: str = "kanaloa"
     focus_turn_id: str | None = None
-    branch_point_message_id: str | None = None  # None = main lineage
     created_at: str = Field(default_factory=current_iso)
     updated_at: str = Field(default_factory=current_iso)
 

@@ -3,6 +3,7 @@
 from .models import (
     AgentBinding,
     AgentCapabilities,
+    BranchBoundary,
     Conversation,
     Message,
     MessageKind,
@@ -15,6 +16,7 @@ from .models import (
 __all__ = [
     "AgentBinding",
     "AgentCapabilities",
+    "BranchBoundary",
     "Conversation",
     "Message",
     "MessageKind",

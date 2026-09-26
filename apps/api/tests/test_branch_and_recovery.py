@@ -46,7 +46,7 @@ import pytest
 from app.adapters.base import AgentCapabilities
 from app.adapters.kanaloa_adapter import KanaloaAdapter
 from app.adapters.mock_adapter import MockAdapter
-from app.domain.models import Conversation, Message, Turn
+from app.domain.models import BranchBoundary, Conversation, Message, Turn
 from app.harness.coordinator import HarnessCoordinator
 from app.harness.dispatcher import Dispatcher
 from app.harness.mailbox import MailboxManager
@@ -113,9 +113,10 @@ def test_branch_from_historical_message(harness_env):
     """
     Verify creating a branch from a historical message:
     - Same conversation_id.
-    - Establishes history boundary ending at message_id.
-    - Creates isolated Turn with branch_point_message_id = message_id.
+    - Establishes history boundary ending at message_id (BranchBoundary).
+    - Creates isolated Turn with branch_id = branch.branch_id.
     - Does not create a new Conversation object.
+    - Decouples Branch from Turn (one Branch can host multiple subsequent Turns).
     """
     store, mbx_mgr, coord, dispatcher = harness_env
 
@@ -136,7 +137,11 @@ def test_branch_from_historical_message(harness_env):
     branch_turn = dispatcher.branch_from_message("conv_main", "m3", title="Alternative Step 2")
 
     assert branch_turn.conversation_id == "conv_main"
-    assert branch_turn.branch_point_message_id == "m3"
+    assert branch_turn.branch_id != "main"
+    branch = store.get_branch(branch_turn.branch_id)
+    assert branch is not None
+    assert branch.branch_point_message_id == "m3"
+    assert branch.name == "Alternative Step 2"
     assert branch_turn.title == "Alternative Step 2"
     assert branch_turn.turn_id != "turn_main_1"
     assert branch_turn.status == "running"
@@ -378,13 +383,21 @@ def test_branch_survives_store_restart():
         for m in [m1, m2, m3]:
             store1.append_message(m)
 
-        # Branch from m2
+        # Branch from m2: BranchBoundary + Turn
+        branch_obj = BranchBoundary(
+            branch_id="branch_persist_1",
+            conversation_id="c_persist",
+            branch_point_message_id="m2",
+            name="Persist Branch",
+        )
+        store1.save_branch(branch_obj)
+
         t_branch = Turn(
             turn_id="t_branch",
             conversation_id="c_persist",
             bound_agent_id="kanaloa",
+            branch_id="branch_persist_1",
             status="running",
-            branch_point_message_id="m2",
         )
         store1.save_turn(t_branch)
 
@@ -407,12 +420,16 @@ def test_branch_survives_store_restart():
         coord2 = HarnessCoordinator(store2, mbx2)
         disp2 = Dispatcher(store2, coord2, mbx2)
 
-        # Verify turns
+        # Verify turns and branches
         loaded_main = store2.get_turn("t_main")
         loaded_branch = store2.get_turn("t_branch")
         assert loaded_main is not None
         assert loaded_branch is not None
-        assert loaded_branch.branch_point_message_id == "m2"
+        assert loaded_branch.branch_id == "branch_persist_1"
+
+        loaded_branch_boundary = store2.get_branch("branch_persist_1")
+        assert loaded_branch_boundary is not None
+        assert loaded_branch_boundary.branch_point_message_id == "m2"
 
         # Verify lineage histories
         branch_history = disp2.get_turn_history(loaded_branch)
@@ -424,6 +441,110 @@ def test_branch_survives_store_restart():
         assert "mb1" not in [m.message_id for m in main_history]
 
         store2.close()
+
+
+def test_one_branch_can_host_multiple_turns(harness_env):
+    """
+    Verify architectural invariant (Branch != Turn, §16, §17):
+    Conversation
+    └─ Branch B
+       ├─ Turn X: research code
+       └─ Turn Y: New Task download files
+    Both Turn X and Turn Y operate in Branch B, sharing Branch B's history worldline,
+    while completely isolated from Main and from any other branches.
+    """
+    store, mbx_mgr, coord, dispatcher = harness_env
+    conv = Conversation(conversation_id="c_multi_turn", bound_agent_id="mock")
+    store.save_conversation(conv)
+
+    t_main = dispatcher.create_new_turn("c_multi_turn", title="Main Task 1")
+    # Main messages
+    m1 = Message(message_id="m1", conversation_id="c_multi_turn", turn_id=t_main.turn_id, sender="user", content="Step 1")
+    m2 = Message(message_id="m2", conversation_id="c_multi_turn", turn_id=t_main.turn_id, sender="agent", content="Step 1 Reply", parent_id="m1")
+    m3 = Message(message_id="m3", conversation_id="c_multi_turn", turn_id=t_main.turn_id, sender="user", content="Step 2 Main", parent_id="m2")
+    for m in [m1, m2, m3]:
+        store.append_message(m)
+
+    # User branches from m2
+    turn_x = dispatcher.branch_from_message("c_multi_turn", "m2", title="Turn X: Research")
+    branch_id = turn_x.branch_id
+    assert branch_id != "main"
+
+    # Turn X produces messages in Branch B
+    mx1 = Message(message_id="mx1", conversation_id="c_multi_turn", turn_id=turn_x.turn_id, sender="user", content="Researching code", parent_id="m2")
+    mx2 = Message(message_id="mx2", conversation_id="c_multi_turn", turn_id=turn_x.turn_id, sender="agent", content="Code analysis done", parent_id="mx1")
+    store.append_message(mx1)
+    store.append_message(mx2)
+
+    # User creates "New Task" inside Branch B -> Turn Y
+    turn_y = dispatcher.create_new_turn("c_multi_turn", branch_id=branch_id, title="Turn Y: Download files")
+    assert turn_y.branch_id == branch_id
+    assert turn_y.turn_id != turn_x.turn_id
+
+    # Turn Y produces message in Branch B
+    my1 = Message(message_id="my1", conversation_id="c_multi_turn", turn_id=turn_y.turn_id, sender="user", content="Download dataset", parent_id="mx2")
+    store.append_message(my1)
+
+    # Verify Turn Y sees: [m1, m2] (from base lineage) + [mx1, mx2] (Turn X) + [my1] (Turn Y)
+    hist_y = dispatcher.get_turn_history(turn_y)
+    assert [m.message_id for m in hist_y] == ["m1", "m2", "mx1", "mx2", "my1"]
+    assert "m3" not in [m.message_id for m in hist_y]
+
+    # Verify Main Turn sees only [m1, m2, m3], never mx1, mx2, my1
+    hist_main = dispatcher.get_turn_history(t_main)
+    assert [m.message_id for m in hist_main] == ["m1", "m2", "m3"]
+    assert "mx1" not in [m.message_id for m in hist_main]
+    assert "my1" not in [m.message_id for m in hist_main]
+
+
+def test_branch_lineage_no_rowid_cross_pollution(harness_env):
+    """
+    Verify user directive:
+    M1 -> M2
+    M2 -> Branch X -> MX  (written first into DB)
+    M2 -> Main -> M3      (written later into DB)
+    Now branch from M3 -> Branch Y.
+    Must strictly follow parent_id lineage: Branch Y must NEVER include MX,
+    even though MX was physically inserted before M3.
+    """
+    store, mbx_mgr, coord, dispatcher = harness_env
+    conv = Conversation(conversation_id="c_tree_iso", bound_agent_id="mock")
+    store.save_conversation(conv)
+
+    t_main = dispatcher.create_new_turn("c_tree_iso", title="Main")
+
+    # M1 and M2
+    m1 = Message(message_id="m1", conversation_id="c_tree_iso", turn_id=t_main.turn_id, sender="user", content="M1")
+    m2 = Message(message_id="m2", conversation_id="c_tree_iso", turn_id=t_main.turn_id, sender="agent", content="M2", parent_id="m1")
+    store.append_message(m1)
+    store.append_message(m2)
+
+    # Branch X from M2, written FIRST into DB
+    t_x = dispatcher.branch_from_message("c_tree_iso", "m2", title="Branch X")
+    mx = Message(message_id="mx", conversation_id="c_tree_iso", turn_id=t_x.turn_id, sender="user", content="MX in branch X", parent_id="m2")
+    store.append_message(mx)
+
+    # Main continues with M3, written LATER into DB
+    m3 = Message(message_id="m3", conversation_id="c_tree_iso", turn_id=t_main.turn_id, sender="user", content="M3 in main", parent_id="m2")
+    store.append_message(m3)
+
+    # Now branch from M3 -> Branch Y
+    t_y = dispatcher.branch_from_message("c_tree_iso", "m3", title="Branch Y")
+    my = Message(message_id="my", conversation_id="c_tree_iso", turn_id=t_y.turn_id, sender="user", content="MY in branch Y", parent_id="m3")
+    store.append_message(my)
+
+    # Branch Y visible history check:
+    # Must strictly be [m1, m2, m3, my]. MX must NEVER be present!
+    hist_y = dispatcher.get_turn_history(t_y)
+    assert [m.message_id for m in hist_y] == ["m1", "m2", "m3", "my"]
+    assert "mx" not in [m.message_id for m in hist_y]
+
+    # Branch X visible history check:
+    # Must strictly be [m1, m2, mx]. Neither m3 nor my must be present!
+    hist_x = dispatcher.get_turn_history(t_x)
+    assert [m.message_id for m in hist_x] == ["m1", "m2", "mx"]
+    assert "m3" not in [m.message_id for m in hist_x]
+    assert "my" not in [m.message_id for m in hist_x]
 
 
 # ==============================================================================
@@ -782,3 +903,30 @@ async def test_explicit_turn_dispatch_does_not_implicitly_change_focus(harness_e
 
     # Focus must remain t_focus!
     assert store.get_conversation("c_no_imp").focus_turn_id == t_focus.turn_id
+
+
+@pytest.mark.asyncio
+async def test_cancel_and_inspect_do_not_implicitly_change_focus(harness_env):
+    """
+    Verify user directive:
+    Explicit actions on background turn (such as cancel, inspect) do NOT implicitly modify focus_turn_id.
+    Only explicit set_focus_turn changes focus.
+    """
+    store, mbx_mgr, coord, dispatcher = harness_env
+    adapter = MockAdapter()
+    coord.register_adapter("mock", adapter)
+
+    conv = Conversation(conversation_id="c_cancel_focus", bound_agent_id="mock")
+    store.save_conversation(conv)
+
+    t_focus = dispatcher.create_new_turn("c_cancel_focus", title="Focus Turn")
+    t_background = dispatcher.create_new_turn("c_cancel_focus", title="Background Turn")
+
+    dispatcher.set_focus_turn("c_cancel_focus", t_focus.turn_id)
+    assert store.get_conversation("c_cancel_focus").focus_turn_id == t_focus.turn_id
+
+    # Cancel background turn
+    await dispatcher.cancel_turn(t_background.turn_id, reason="cancel_bg")
+
+    # Focus must remain t_focus!
+    assert store.get_conversation("c_cancel_focus").focus_turn_id == t_focus.turn_id

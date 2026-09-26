@@ -13,6 +13,7 @@ from typing import Sequence
 
 from ..domain.models import (
     AgentBinding,
+    BranchBoundary,
     Conversation,
     Message,
     Turn,
@@ -22,6 +23,27 @@ from ..domain.models import (
 
 class BaseStore(ABC):
     """Abstract store interface defining all persistence contracts."""
+
+    # --- Branch Boundary Operations (§16, §17) ---
+    @abstractmethod
+    def save_branch(self, branch: BranchBoundary) -> None:
+        """Create or update a branch boundary."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_branch(self, branch_id: str) -> BranchBoundary | None:
+        """Fetch branch boundary by branch_id."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_branches(self, conversation_id: str) -> list[BranchBoundary]:
+        """List all branches belonging to a conversation."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_or_create_main_branch(self, conversation_id: str) -> BranchBoundary:
+        """Get or create the root main branch for a conversation."""
+        raise NotImplementedError
 
     # --- Conversation Operations ---
     @abstractmethod

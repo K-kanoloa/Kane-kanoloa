@@ -11,6 +11,7 @@ from .base import BaseStore
 from ..domain.models import (
     AgentBinding,
     AgentCapabilities,
+    BranchBoundary,
     Conversation,
     Message,
     Turn,
@@ -58,10 +59,26 @@ class SQLiteStore(BaseStore):
                     title TEXT NOT NULL,
                     bound_agent_id TEXT NOT NULL,
                     focus_turn_id TEXT,
-                    branch_point_message_id TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS branches (
+                    branch_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    branch_point_message_id TEXT,
+                    name TEXT,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_branches_conversation_id
+                ON branches (conversation_id, created_at);
                 """
             )
             conn.execute(
@@ -99,10 +116,10 @@ class SQLiteStore(BaseStore):
                     turn_id TEXT PRIMARY KEY,
                     conversation_id TEXT NOT NULL,
                     bound_agent_id TEXT NOT NULL,
+                    branch_id TEXT NOT NULL DEFAULT 'main',
                     title TEXT,
                     status TEXT NOT NULL,
                     native_session_ref TEXT,
-                    branch_point_message_id TEXT,
                     last_event_at TEXT NOT NULL,
                     interrupt_reason TEXT,
                     partial_output TEXT,
@@ -154,14 +171,68 @@ class SQLiteStore(BaseStore):
             existing_columns = {row["name"] for row in cursor.fetchall()}
             if "partial_output" not in existing_columns:
                 conn.execute("ALTER TABLE turns ADD COLUMN partial_output TEXT;")
-            if "branch_point_message_id" not in existing_columns:
-                conn.execute("ALTER TABLE turns ADD COLUMN branch_point_message_id TEXT;")
+            if "branch_id" not in existing_columns:
+                conn.execute("ALTER TABLE turns ADD COLUMN branch_id TEXT NOT NULL DEFAULT 'main';")
 
             cursor_msg = conn.execute("PRAGMA table_info(messages);")
             existing_msg_cols = {row["name"] for row in cursor_msg.fetchall()}
             if "turn_id" not in existing_msg_cols:
                 conn.execute("ALTER TABLE messages ADD COLUMN turn_id TEXT;")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_turn_id ON messages (turn_id);")
+
+    # --- Branch Boundary Operations (§16, §17) ---
+    def save_branch(self, branch: BranchBoundary) -> None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO branches (
+                    branch_id, conversation_id, branch_point_message_id, name, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(branch_id) DO UPDATE SET
+                    branch_point_message_id = excluded.branch_point_message_id,
+                    name = excluded.name;
+                """,
+                (
+                    branch.branch_id,
+                    branch.conversation_id,
+                    branch.branch_point_message_id,
+                    branch.name,
+                    branch.created_at,
+                ),
+            )
+
+    def get_branch(self, branch_id: str) -> BranchBoundary | None:
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM branches WHERE branch_id = ?;",
+            (branch_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return BranchBoundary(**dict(row))
+
+    def list_branches(self, conversation_id: str) -> list[BranchBoundary]:
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT * FROM branches WHERE conversation_id = ? ORDER BY created_at ASC;",
+            (conversation_id,),
+        ).fetchall()
+        return [BranchBoundary(**dict(r)) for r in rows]
+
+    def get_or_create_main_branch(self, conversation_id: str) -> BranchBoundary:
+        branches = self.list_branches(conversation_id)
+        for b in branches:
+            if b.branch_point_message_id is None:
+                return b
+        main_branch = BranchBoundary(
+            branch_id=f"main_{conversation_id}",
+            conversation_id=conversation_id,
+            branch_point_message_id=None,
+            name="Main",
+        )
+        self.save_branch(main_branch)
+        return main_branch
 
     # --- Conversation Operations ---
     def save_conversation(self, conversation: Conversation) -> None:
@@ -171,13 +242,12 @@ class SQLiteStore(BaseStore):
                 """
                 INSERT INTO conversations (
                     conversation_id, title, bound_agent_id, focus_turn_id,
-                    branch_point_message_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(conversation_id) DO UPDATE SET
                     title = excluded.title,
                     bound_agent_id = excluded.bound_agent_id,
                     focus_turn_id = excluded.focus_turn_id,
-                    branch_point_message_id = excluded.branch_point_message_id,
                     updated_at = excluded.updated_at;
                 """,
                 (
@@ -185,7 +255,6 @@ class SQLiteStore(BaseStore):
                     conversation.title,
                     conversation.bound_agent_id,
                     conversation.focus_turn_id,
-                    conversation.branch_point_message_id,
                     conversation.created_at,
                     conversation.updated_at,
                 ),
@@ -199,14 +268,21 @@ class SQLiteStore(BaseStore):
         ).fetchone()
         if not row:
             return None
-        return Conversation(**dict(row))
+        row_dict = dict(row)
+        row_dict.pop("branch_point_message_id", None)
+        return Conversation(**row_dict)
 
     def list_conversations(self) -> list[Conversation]:
         conn = self._get_connection()
         rows = conn.execute(
             "SELECT * FROM conversations ORDER BY updated_at DESC;"
         ).fetchall()
-        return [Conversation(**dict(r)) for r in rows]
+        result = []
+        for r in rows:
+            d = dict(r)
+            d.pop("branch_point_message_id", None)
+            result.append(Conversation(**d))
+        return result
 
     # --- Message Operations (Append-Only) ---
     def append_message(self, message: Message) -> None:
@@ -241,15 +317,16 @@ class SQLiteStore(BaseStore):
     ) -> list[Message]:
         conn = self._get_connection()
         if up_to_message_id:
-            # Check if parent_id lineage is present
+            # Query target message
             target = conn.execute(
-                "SELECT rowid, * FROM messages WHERE message_id = ? AND conversation_id = ?;",
+                "SELECT * FROM messages WHERE message_id = ? AND conversation_id = ?;",
                 (up_to_message_id, conversation_id),
             ).fetchone()
             if not target:
                 return []
 
-            # Lineage walk backwards via parent_id if linked
+            # Pure tree lineage walk backwards via parent_id (§16, §17)
+            # Zero reliance on rowid or insertion order
             lineage: list[Message] = []
             curr_id: str | None = up_to_message_id
             visited: set[str] = set()
@@ -257,7 +334,7 @@ class SQLiteStore(BaseStore):
             while curr_id and curr_id not in visited:
                 visited.add(curr_id)
                 row = conn.execute(
-                    "SELECT rowid, * FROM messages WHERE message_id = ?;",
+                    "SELECT * FROM messages WHERE message_id = ?;",
                     (curr_id,),
                 ).fetchone()
                 if not row:
@@ -268,20 +345,8 @@ class SQLiteStore(BaseStore):
                 lineage.append(msg)
                 curr_id = msg.parent_id
 
-            if len(lineage) > 1 or target["parent_id"] is not None:
-                lineage.reverse()
-                return lineage
-
-            # Fallback: slice by rowid boundary (strict monotonic insertion order)
-            rows = conn.execute(
-                """
-                SELECT * FROM messages
-                WHERE conversation_id = ? AND rowid <= ?
-                ORDER BY rowid ASC;
-                """,
-                (conversation_id, target["rowid"]),
-            ).fetchall()
-            return [Message(**dict(r)) for r in rows]
+            lineage.reverse()
+            return lineage
 
         # Normal full history for conversation
         rows = conn.execute(
@@ -321,15 +386,15 @@ class SQLiteStore(BaseStore):
             conn.execute(
                 """
                 INSERT INTO turns (
-                    turn_id, conversation_id, bound_agent_id, title, status,
-                    native_session_ref, branch_point_message_id, last_event_at, interrupt_reason,
+                    turn_id, conversation_id, bound_agent_id, branch_id, title, status,
+                    native_session_ref, last_event_at, interrupt_reason,
                     partial_output, created_at, finished_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(turn_id) DO UPDATE SET
+                    branch_id = excluded.branch_id,
                     title = excluded.title,
                     status = excluded.status,
                     native_session_ref = excluded.native_session_ref,
-                    branch_point_message_id = excluded.branch_point_message_id,
                     last_event_at = excluded.last_event_at,
                     interrupt_reason = excluded.interrupt_reason,
                     partial_output = excluded.partial_output,
@@ -339,10 +404,10 @@ class SQLiteStore(BaseStore):
                     turn.turn_id,
                     turn.conversation_id,
                     turn.bound_agent_id,
+                    turn.branch_id,
                     turn.title,
                     turn.status,
                     turn.native_session_ref,
-                    turn.branch_point_message_id,
                     turn.last_event_at,
                     turn.interrupt_reason,
                     turn.partial_output,
@@ -353,6 +418,9 @@ class SQLiteStore(BaseStore):
 
     @staticmethod
     def _normalize_turn_data(data: dict) -> dict:
+        data.pop("branch_point_message_id", None)
+        if not data.get("branch_id"):
+            data["branch_id"] = "main"
         valid_statuses = {"running", "waiting_user", "finished", "failed", "interrupted"}
         status = data.get("status")
         if status not in valid_statuses:
@@ -442,10 +510,10 @@ class SQLiteStore(BaseStore):
             conn.execute(
                 """
                 INSERT INTO turns (
-                    turn_id, conversation_id, bound_agent_id, title, status,
+                    turn_id, conversation_id, bound_agent_id, branch_id, title, status,
                     native_session_ref, last_event_at, interrupt_reason,
                     partial_output, created_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(turn_id) DO UPDATE SET
                     status = excluded.status,
                     partial_output = NULL,
@@ -456,6 +524,7 @@ class SQLiteStore(BaseStore):
                     turn.turn_id,
                     turn.conversation_id,
                     turn.bound_agent_id,
+                    turn.branch_id,
                     turn.title,
                     turn.status,
                     turn.native_session_ref,

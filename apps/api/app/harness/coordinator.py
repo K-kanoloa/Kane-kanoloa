@@ -139,10 +139,19 @@ class HarnessCoordinator(AgentEventHandler):
         # Resolve final content: explicit content, or accumulated partial_output buffer
         final_content = content if content is not None else (turn.partial_output or "")
 
+        # Resolve parent_id: latest message in this turn/conversation for true tree lineage
+        turn_msgs = [
+            m for m in self.store.get_messages(turn.conversation_id)
+            if m.turn_id == turn.turn_id
+        ]
+        parent_id = turn_msgs[-1].message_id if turn_msgs else None
+
         message = Message(
             conversation_id=turn.conversation_id,
+            turn_id=turn.turn_id,
             sender="agent",
             sender_id=sender_id or turn.bound_agent_id,
+            parent_id=parent_id,
             content=final_content,
         )
         # Update turn state and prepare completion status event

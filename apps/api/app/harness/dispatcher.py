@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..domain.models import Message, Turn, current_iso
+from ..domain.models import BranchBoundary, Message, Turn, current_iso
 from ..store.base import BaseStore
 from .coordinator import HarnessCoordinator
 from .mailbox import MailboxItem, MailboxManager
@@ -136,19 +136,16 @@ class Dispatcher:
         self.store.save_conversation(conv)
         return turn
 
-    def branch_from_message(
+    def create_branch(
         self,
         conversation_id: str,
         message_id: str,
-        title: str | None = None,
-    ) -> Turn:
+        name: str | None = None,
+    ) -> BranchBoundary:
         """
-        Explicitly create a new Branch path inside the same Conversation (§16, §17, §40).
-        - Verifies message_id belongs to conversation_id.
-        - Establishes a new history boundary ending at message_id.
-        - Creates a new isolated Turn with branch_point_message_id = message_id.
-        - Does NOT create a new Conversation object (maintains same conversation_id).
-        - Does NOT rewrite or delete any historical messages.
+        Create a new persistent history boundary (Branch) inside a conversation (§16, §17).
+        Branch is decoupled from Turn: a Branch represents a history worldline that can host
+        multiple subsequent Turns.
         """
         conv = self.store.get_conversation(conversation_id)
         if not conv:
@@ -162,12 +159,38 @@ class Dispatcher:
                 f"Message '{message_id}' belongs to conversation '{msg.conversation_id}', not '{conversation_id}'"
             )
 
+        branch = BranchBoundary(
+            conversation_id=conversation_id,
+            branch_point_message_id=message_id,
+            name=name,
+        )
+        self.store.save_branch(branch)
+        return branch
+
+    def branch_from_message(
+        self,
+        conversation_id: str,
+        message_id: str,
+        title: str | None = None,
+    ) -> Turn:
+        """
+        Explicitly create a new Branch path inside the same Conversation (§16, §17, §40).
+        1. Creates BranchBoundary metadata (history boundary).
+        2. Spawns the initial isolated Turn operating on this new branch (branch_id = branch.branch_id).
+        Does NOT conflate Branch with Turn: subsequent Turns can be created on this branch.
+        """
+        conv = self.store.get_conversation(conversation_id)
+        if not conv:
+            raise ValueError(f"Conversation '{conversation_id}' not found")
+
+        branch = self.create_branch(conversation_id, message_id, name=title)
+
         branch_turn = Turn(
             conversation_id=conversation_id,
             bound_agent_id=conv.bound_agent_id,
+            branch_id=branch.branch_id,
             status="running",
             title=title or f"Branch from {message_id}",
-            branch_point_message_id=message_id,
         )
         self.store.save_turn(branch_turn)
         return branch_turn
@@ -175,41 +198,62 @@ class Dispatcher:
     def get_turn_history(self, turn: Turn) -> list[Message]:
         """
         Compute the visible historical messages for a Turn (§16, §17, §40):
-        - If Turn is a Branch (turn.branch_point_message_id is set):
-          Visible history = [lineage up to branch_point_message_id] + [prior messages of this branch turn].
+        Branch = conversation history worldline.
+        Turn = work lifecycle within that worldline.
+
+        - If Turn is on a side branch (branch_point_message_id is not None):
+          Visible history = [lineage up to branch_point_message_id via parent_id walk]
+                          + [all messages from turns operating in this branch].
           Never sees main messages created after the branch point.
-        - If Turn is on the Main branch (turn.branch_point_message_id is None):
-          Visible history = all messages in conversation EXCLUDING messages from branch turns.
+          Never sees messages from other side branches.
+        - If Turn is on the Main branch (branch_id == 'main' or no branch_point):
+          Visible history = all messages in conversation EXCLUDING messages from side branch turns.
           Never sees branch messages.
         """
         conversation_id = turn.conversation_id
         all_conv_messages = self.store.get_messages(conversation_id)
+        all_turns = self.store.list_turns(conversation_id)
 
-        if turn.branch_point_message_id:
-            # 1. Base historical lineage up to branch point
+        branch = self.store.get_branch(turn.branch_id) if turn.branch_id and turn.branch_id != "main" else None
+        branch_point = branch.branch_point_message_id if branch else None
+
+        if branch_point:
+            # 1. Base historical lineage up to branch point (pure parent_id walk, zero rowid fallback)
             base_history = self.store.get_messages(
                 conversation_id,
-                up_to_message_id=turn.branch_point_message_id,
+                up_to_message_id=branch_point,
             )
             base_ids = {m.message_id for m in base_history}
 
-            # 2. Add prior messages belonging strictly to this branch turn
+            # 2. Add prior messages belonging to any Turn operating on this branch
+            branch_turn_ids = {
+                t.turn_id for t in all_turns if getattr(t, "branch_id", "main") == turn.branch_id
+            }
             branch_turn_msgs = [
                 m for m in all_conv_messages
-                if m.turn_id == turn.turn_id and m.message_id not in base_ids
+                if m.turn_id in branch_turn_ids and m.message_id not in base_ids
             ]
             return base_history + branch_turn_msgs
         else:
-            # Main lineage: exclude messages belonging to branch turns
-            all_turns = self.store.list_turns(conversation_id)
-            branch_turn_ids = {
-                t.turn_id for t in all_turns if t.branch_point_message_id is not None
+            # Main lineage: exclude messages belonging to turns on any side branch
+            side_branches = {
+                b.branch_id for b in self.store.list_branches(conversation_id)
+                if b.branch_point_message_id is not None
             }
-            return [m for m in all_conv_messages if m.turn_id not in branch_turn_ids]
+            side_branch_turn_ids = {
+                t.turn_id for t in all_turns if getattr(t, "branch_id", "main") in side_branches
+            }
+            return [m for m in all_conv_messages if m.turn_id not in side_branch_turn_ids]
 
-    def create_new_turn(self, conversation_id: str, title: str | None = None) -> Turn:
+    def create_new_turn(
+        self,
+        conversation_id: str,
+        branch_id: str | None = None,
+        title: str | None = None,
+    ) -> Turn:
         """
         Explicitly create an additional independent Turn for a conversation (New Turn).
+        Can be created on 'main' or on an existing side branch.
         """
         conv = self.store.get_conversation(conversation_id)
         if not conv:
@@ -217,9 +261,20 @@ class Dispatcher:
             conv = Conversation(conversation_id=conversation_id)
             self.store.save_conversation(conv)
 
+        # Resolve target branch: explicit branch_id, or branch of focus turn, or 'main'
+        target_branch_id = branch_id
+        if not target_branch_id:
+            if conv.focus_turn_id:
+                focus = self.store.get_turn(conv.focus_turn_id)
+                if focus and getattr(focus, "branch_id", None):
+                    target_branch_id = focus.branch_id
+        if not target_branch_id:
+            target_branch_id = "main"
+
         new_turn = Turn(
             conversation_id=conversation_id,
             bound_agent_id=conv.bound_agent_id,
+            branch_id=target_branch_id,
             status="running",
             title=title or "New Turn",
         )
@@ -256,12 +311,34 @@ class Dispatcher:
 
         # Resolve effective parent_id for branch lineage
         effective_parent_id = parent_id
-        if effective_parent_id is None and turn.branch_point_message_id:
-            turn_msgs = [m for m in self.store.get_messages(conversation_id) if m.turn_id == turn.turn_id]
-            if turn_msgs:
-                effective_parent_id = turn_msgs[-1].message_id
+        if effective_parent_id is None:
+            # Look up messages already belonging to this branch
+            branch_turn_ids = {
+                t.turn_id for t in self.store.list_turns(conversation_id)
+                if getattr(t, "branch_id", "main") == turn.branch_id
+            }
+            branch_msgs = [
+                m for m in self.store.get_messages(conversation_id)
+                if m.turn_id in branch_turn_ids
+            ]
+            if branch_msgs:
+                effective_parent_id = branch_msgs[-1].message_id
             else:
-                effective_parent_id = turn.branch_point_message_id
+                # First message in this branch:
+                branch = self.store.get_branch(turn.branch_id) if turn.branch_id and turn.branch_id != "main" else None
+                if branch and branch.branch_point_message_id:
+                    effective_parent_id = branch.branch_point_message_id
+                else:
+                    # Root message in main branch: link to last main message if any
+                    main_turn_ids = {
+                        t.turn_id for t in self.store.list_turns(conversation_id)
+                        if getattr(t, "branch_id", "main") == "main"
+                    }
+                    main_msgs = [
+                        m for m in self.store.get_messages(conversation_id)
+                        if m.turn_id in main_turn_ids
+                    ]
+                    effective_parent_id = main_msgs[-1].message_id if main_msgs else None
 
         # 2. Append User Message with explicit turn_id
         user_msg = Message(
