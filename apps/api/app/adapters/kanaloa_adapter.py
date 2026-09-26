@@ -58,9 +58,24 @@ class KanaloaAdapter(BaseAdapter):
         event_handler: AgentEventHandler | None = None,
     ) -> None:
         super().__init__(event_handler)
-        default_npx = "npx.cmd" if sys.platform == "win32" else "npx"
-        self.command = command or [default_npx, "--yes", "@deepseek-ai/dsh", "--profile", "acp"]
         self.cwd = cwd or os.getcwd()
+
+        if command:
+            self.command = command
+        else:
+            # Deterministic downstream resolution: prefer project-local DSH if present, fallback to npx
+            local_dsh = os.path.join(self.cwd, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")
+            if not os.path.exists(local_dsh):
+                repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+                candidate = os.path.join(repo_root, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")
+                if os.path.exists(candidate):
+                    local_dsh = candidate
+
+            if os.path.exists(local_dsh):
+                self.command = ["node", local_dsh, "--profile", "acp"]
+            else:
+                default_npx = "npx.cmd" if sys.platform == "win32" else "npx"
+                self.command = [default_npx, "--yes", "@deepseek-ai/dsh", "--profile", "acp"]
 
         self._process: asyncio.subprocess.Process | None = None
         self._turn_sessions: dict[str, str] = {}  # turn_id -> native_sessionId
