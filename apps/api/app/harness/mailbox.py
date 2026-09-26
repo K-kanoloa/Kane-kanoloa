@@ -38,7 +38,6 @@ class TurnMailbox:
     def __init__(self, turn_id: str) -> None:
         self.turn_id = turn_id
         self._queue: asyncio.Queue[MailboxItem] = asyncio.Queue()
-        self._history: list[MailboxItem] = []
 
     async def put(self, item: MailboxItem) -> None:
         """Enqueue an inbound item for this turn."""
@@ -46,7 +45,6 @@ class TurnMailbox:
             raise ValueError(
                 f"Cannot put item for turn {item.turn_id} into mailbox for {self.turn_id}"
             )
-        self._history.append(item)
         await self._queue.put(item)
 
     def put_nowait(self, item: MailboxItem) -> None:
@@ -55,7 +53,6 @@ class TurnMailbox:
             raise ValueError(
                 f"Cannot put item for turn {item.turn_id} into mailbox for {self.turn_id}"
             )
-        self._history.append(item)
         self._queue.put_nowait(item)
 
     async def get(self, timeout: float | None = None) -> MailboxItem | None:

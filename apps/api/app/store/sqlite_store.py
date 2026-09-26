@@ -269,7 +269,6 @@ class SQLiteStore(BaseStore):
         if not row:
             return None
         row_dict = dict(row)
-        row_dict.pop("branch_point_message_id", None)
         return Conversation(**row_dict)
 
     def list_conversations(self) -> list[Conversation]:
@@ -277,12 +276,7 @@ class SQLiteStore(BaseStore):
         rows = conn.execute(
             "SELECT * FROM conversations ORDER BY updated_at DESC;"
         ).fetchall()
-        result = []
-        for r in rows:
-            d = dict(r)
-            d.pop("branch_point_message_id", None)
-            result.append(Conversation(**d))
-        return result
+        return [Conversation(**dict(r)) for r in rows]
 
     # --- Message Operations (Append-Only) ---
     def append_message(self, message: Message) -> None:

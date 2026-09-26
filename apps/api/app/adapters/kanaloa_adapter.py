@@ -15,7 +15,7 @@ Disciplines:
      - supports_parallel_sessions = True (verified via multiple sessions on single connection)
      - max_parallel_sessions = None (not statically capped by adapter; bound by DSH/system resources)
      - steer_mode = 'native' (verified: session/steer extension submits steering to active native session mid-flight)
-     - branch_mode = 'unsupported'
+     - branch_mode = 'replay'
   4. Two-state Prompt semantics with Non-Negotiable Side-Effect Boundary:
      - State A (Active Session): incremental prompt only
      - State B (Bootstrap / Session Rebuild): reconstruction != replay historical execution
@@ -148,11 +148,47 @@ class KanaloaAdapter(BaseAdapter):
             return False
         return self._process.returncode is None
 
+    async def _cleanup_process(self) -> None:
+        """Mechanical cleanup of subprocess, background tasks, and pending futures."""
+        self._is_initialized = False
+
+        # Reject any pending requests fail-closed so awaiting coroutines do not hang
+        pending = list(self._pending_requests.items())
+        self._pending_requests.clear()
+        for req_id, fut in pending:
+            if not fut.done():
+                fut.set_exception(RuntimeError("ACP process disconnected or terminated"))
+
+        # Cancel reader and stderr background tasks
+        if self._reader_task and not self._reader_task.done():
+            self._reader_task.cancel()
+        if self._stderr_task and not self._stderr_task.done():
+            self._stderr_task.cancel()
+        self._reader_task = None
+        self._stderr_task = None
+
+        # Terminate / kill subprocess
+        if self._process:
+            if self._process.returncode is None:
+                try:
+                    self._process.terminate()
+                    await asyncio.wait_for(self._process.wait(), timeout=2.0)
+                except Exception:
+                    if self._process.returncode is None:
+                        try:
+                            self._process.kill()
+                        except Exception:
+                            pass
+            self._process = None
+
     async def _ensure_process(self) -> None:
         """Ensure ACP subprocess is launched and initialized."""
         async with self._lock:
             if self.is_alive() and self._is_initialized:
                 return
+
+            if self._process is not None:
+                await self._cleanup_process()
 
             logger.info("KanaloaAdapter: launching ACP subprocess: %s", " ".join(self.command))
             self._process = await asyncio.create_subprocess_exec(
@@ -165,19 +201,23 @@ class KanaloaAdapter(BaseAdapter):
             self._reader_task = asyncio.create_task(self._read_stdout_loop())
             self._stderr_task = asyncio.create_task(self._read_stderr_loop())
 
-            # Perform ACP initialize handshake
-            init_resp = await self._send_request(
-                "initialize",
-                {
-                    "protocolVersion": 1,
-                    "clientInfo": {"name": "kane-harness", "version": "2.0.0"},
-                    "capabilities": {},
-                },
-            )
-            if "error" in init_resp:
-                raise RuntimeError(f"ACP initialization failed: {init_resp['error']}")
-            self._is_initialized = True
-            logger.info("KanaloaAdapter: initialized successfully with agentInfo: %s", init_resp.get("result", {}).get("agentInfo"))
+            try:
+                # Perform ACP initialize handshake
+                init_resp = await self._send_request(
+                    "initialize",
+                    {
+                        "protocolVersion": 1,
+                        "clientInfo": {"name": "kane-harness", "version": "2.0.0"},
+                        "capabilities": {},
+                    },
+                )
+                if "error" in init_resp:
+                    raise RuntimeError(f"ACP initialization failed: {init_resp['error']}")
+                self._is_initialized = True
+                logger.info("KanaloaAdapter: initialized successfully with agentInfo: %s", init_resp.get("result", {}).get("agentInfo"))
+            except Exception:
+                await self._cleanup_process()
+                raise
 
     async def _send_request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Send JSON-RPC request and await response."""
@@ -420,6 +460,7 @@ class KanaloaAdapter(BaseAdapter):
 
         perm.status = "resolved"
         perm.decision = decision
+        self._pending_permissions.pop(perm_key, None)
         logger.info(
             "KanaloaAdapter: sent permission response %s for request %s (session %s)",
             decision,
@@ -427,25 +468,13 @@ class KanaloaAdapter(BaseAdapter):
             perm.session_id,
         )
 
-        # Resume Turn in Kane: transition waiting_user back to running
+        # Resume Turn in Kane: transition waiting_user back to running via AgentEventHandler
         turn_id = perm.turn_id
-        if turn_id and hasattr(self.event_handler, "store"):
-            store = getattr(self.event_handler, "store")
-            turn = store.get_turn(turn_id)
-            if turn and turn.status == "waiting_user":
-                turn.status = "running"
-                turn.last_event_at = current_iso()
-                store.save_turn(turn)
-                await self.event_handler.emit_event(
-                    turn_id,
-                    "status_change",
-                    {
-                        "status": "running",
-                        "resumed_from": "permission_response",
-                        "permission_request_id": str(request_id),
-                        "decision": decision,
-                    },
-                )
+        if turn_id:
+            await self.event_handler.emit_resumed(
+                turn_id,
+                reason=f"permission_response:{request_id}:{decision}",
+            )
 
     async def _handle_disconnect(
         self,
@@ -475,15 +504,19 @@ class KanaloaAdapter(BaseAdapter):
         for k in keys_to_purge:
             self._pending_permissions.pop(k, None)
 
-        if hasattr(self.event_handler, "store") and self.event_handler.store:
-            store = getattr(self.event_handler, "store")
-            for turn_id in turns_to_interrupt:
-                turn = store.get_turn(turn_id)
-                if turn and turn.status == "waiting_user":
-                    await self.event_handler.emit_interrupted(
-                        turn_id,
-                        reason=f"permission_invalidated:{reason}",
-                    )
+        for turn_id in turns_to_interrupt:
+            await self.event_handler.emit_interrupted(
+                turn_id,
+                reason=f"permission_invalidated:{reason}",
+            )
+
+        # Reject pending RPC requests fail-closed so awaiting futures do not hang indefinitely (P1-01)
+        if session_id is None:
+            pending = list(self._pending_requests.items())
+            self._pending_requests.clear()
+            for req_id, fut in pending:
+                if not fut.done():
+                    fut.set_exception(RuntimeError(f"ACP process disconnected: {reason}"))
 
         if session_id:
             self.runtime.close_ipython_session(session_id)
@@ -505,21 +538,8 @@ class KanaloaAdapter(BaseAdapter):
         self._turn_sessions.clear()
         self._session_turns.clear()
 
-        # 2. Terminate subprocess
-        if self._process and self._process.returncode is None:
-            try:
-                self._process.terminate()
-                await asyncio.wait_for(self._process.wait(), timeout=3.0)
-            except Exception:
-                if self._process.returncode is None:
-                    self._process.kill()
-
-        if self._reader_task and not self._reader_task.done():
-            self._reader_task.cancel()
-        if self._stderr_task and not self._stderr_task.done():
-            self._stderr_task.cancel()
-
-        self._is_initialized = False
+        # 3. Clean up subprocess, background tasks, and pending requests
+        await self._cleanup_process()
 
     # --- BaseAdapter Methods ---
     async def send(
@@ -575,8 +595,11 @@ class KanaloaAdapter(BaseAdapter):
             turn.native_session_ref = session_id
             self.bind_session(turn.turn_id, session_id)
             self._active_sessions.add(session_id)
-            if hasattr(self.event_handler, "store") and self.event_handler.store:
-                self.event_handler.store.save_turn(turn)
+            await self.event_handler.emit_event(
+                turn.turn_id,
+                "status_change",
+                {"native_session_ref": session_id},
+            )
 
             # 2. Construct ACP prompt blocks:
             # Passive history context transcript blocks (read-only, NOT executed as commands)

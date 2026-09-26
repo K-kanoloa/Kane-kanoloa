@@ -86,6 +86,9 @@ class HarnessCoordinator(AgentEventHandler):
         if not turn:
             raise ValueError(f"Turn '{turn_id}' not found")
 
+        if payload and "native_session_ref" in payload:
+            turn.native_session_ref = payload["native_session_ref"]
+
         event = TurnEvent(
             turn_id=turn_id,
             conversation_id=turn.conversation_id,
@@ -211,6 +214,29 @@ class HarnessCoordinator(AgentEventHandler):
         self.store.append_event(status_event)
         self._broadcast_event(status_event)
 
+    async def emit_resumed(
+        self,
+        turn_id: str,
+        reason: str | None = None,
+    ) -> None:
+        """Agent resumes execution (e.g. after approval response). Transitions Turn to 'running'."""
+        turn = self.store.get_turn(turn_id)
+        if not turn:
+            raise ValueError(f"Turn '{turn_id}' not found")
+
+        turn.status = "running"
+        turn.last_event_at = current_iso()
+        self.store.save_turn(turn)
+
+        status_event = TurnEvent(
+            turn_id=turn_id,
+            conversation_id=turn.conversation_id,
+            event_type="status_change",
+            payload={"status": "running", "resumed_from": reason or "adapter_resume"},
+        )
+        self.store.append_event(status_event)
+        self._broadcast_event(status_event)
+
     async def emit_interrupted(
         self,
         turn_id: str,
@@ -310,6 +336,13 @@ class HarnessCoordinator(AgentEventHandler):
             )
             self.store.append_event(boundary_event)
             self._broadcast_event(boundary_event)
+
+    def is_turn_active(self, turn_id: str) -> bool:
+        """Check whether turn is still in active lifecycle (running or waiting_user)."""
+        turn = self.store.get_turn(turn_id)
+        if not turn:
+            return False
+        return turn.status in ("running", "waiting_user")
 
     async def reconcile_startup_turns(self) -> dict[str, str]:
         """

@@ -341,6 +341,7 @@ async def test_loop_mode_early_complete(harness_env):
     async def mock_iter2_resp(params):
         # Emit delta containing COMPLETE
         await kanaloa.event_handler.emit_delta("t_early", "Task is finished. COMPLETE!")
+        kanaloa.runtime.record_delta("t_early", "Task is finished. COMPLETE!")
         return {"result": {"stopReason": "endTurn"}}
 
     kanaloa = LoopMockWireKanaloaAdapter(
@@ -404,6 +405,7 @@ async def test_loop_mode_unlimited_stops_on_complete(harness_env):
     async def mock_iter_resp(params):
         if kanaloa._prompt_call_count == 7:
             await kanaloa.event_handler.emit_delta("t_unl", "All 7 steps done. COMPLETE.")
+            kanaloa.runtime.record_delta("t_unl", "All 7 steps done. COMPLETE.")
         return {"result": {"stopReason": "endTurn"}}
 
     kanaloa = LoopMockWireKanaloaAdapter(
@@ -706,6 +708,7 @@ async def test_loop_mode_approval_does_not_increment_iteration(harness_env):
 
         # Emit [COMPLETE] delta within same iteration
         await kanaloa.event_handler.emit_delta("t_lappr_cnt", "Execution finished after approval. [COMPLETE]")
+        kanaloa.runtime.record_delta("t_lappr_cnt", "Execution finished after approval. [COMPLETE]")
         return {"result": {"stopReason": "endTurn"}}
 
     kanaloa = LoopMockWireKanaloaAdapter(
@@ -760,6 +763,7 @@ async def test_loop_mode_steer_does_not_increment_iteration(harness_env):
 
         # Complete iteration 2
         await kanaloa.event_handler.emit_delta("t_lsteer_cnt", "Adjusted and finished. [COMPLETE]")
+        kanaloa.runtime.record_delta("t_lsteer_cnt", "Adjusted and finished. [COMPLETE]")
         return {"result": {"stopReason": "endTurn"}}
 
     kanaloa = LoopMockWireKanaloaAdapter(

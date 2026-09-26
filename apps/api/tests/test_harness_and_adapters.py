@@ -783,7 +783,7 @@ async def test_strict_capability_gates_cancel_and_resume(harness_env):
     Verify capability gates strictly block/raise instead of silently pretending success:
     - supports_cancel = False raises RuntimeError on cancel_turn
     - supports_resume = False raises RuntimeError on resume_turn
-    - KanaloaAdapter steer() raises NotImplementedError (honest follow_up_only declaration)
+    - KanaloaAdapter steer() enforces native session binding and non-terminal turn status
     """
     from app.adapters.kanaloa_adapter import KanaloaAdapter
 
@@ -1153,8 +1153,9 @@ async def test_kanaloa_approval_roundtrip_allow_and_reject(harness_env):
         "optionId": "allow-once",
     }
 
-    # 3. Repeated response to resolved request must raise ValueError
-    with pytest.raises(ValueError, match="already resolved"):
+    # 3. Repeated response to resolved request (purged from map) must raise ValueError fail-closed
+    assert kanaloa.get_pending_permission(101) is None
+    with pytest.raises(ValueError, match="Unknown permission request '101'"):
         await kanaloa.respond_permission(101, "allow-once")
 
     # 4. Second permission request with 'reject-once'
@@ -1328,6 +1329,232 @@ async def test_kanaloa_approval_expired_and_unknown_requests(harness_env):
 
     with pytest.raises(ValueError, match="already expired"):
         await kanaloa.respond_permission(302, "allow-once")
+
+
+# ==============================================================================
+# Code Cleanliness Audit Regression Tests (P1-01, P1-02, P1-03, P2-02)
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_pending_rpc_fail_closed_on_disconnect(harness_env):
+    """
+    P1-01 Regression:
+    - Multiple pending RPC requests are queued awaiting ACP response.
+    - Process disconnect / EOF occurs.
+    - All pending futures receive explicit RuntimeError fail-closed.
+    - No coroutines hang on await future.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    kanaloa = KanaloaAdapter(event_handler=coord)
+    mock_stdin = MagicMock()
+    mock_stdin.write = MagicMock()
+    mock_stdin.drain = AsyncMock()
+    mock_process = MagicMock()
+    mock_process.stdin = mock_stdin
+    mock_process.returncode = None
+    kanaloa._process = mock_process
+    kanaloa._is_initialized = True
+
+    # 1. Enqueue two pending requests without response
+    t1 = asyncio.create_task(kanaloa._send_request("test_method_1", {"foo": 1}))
+    t2 = asyncio.create_task(kanaloa._send_request("test_method_2", {"bar": 2}))
+    await asyncio.sleep(0.01)
+
+    assert len(kanaloa._pending_requests) == 2
+
+    # 2. Trigger disconnect
+    await kanaloa._handle_disconnect(reason="test_disconnect")
+
+    # 3. Both futures must fail-closed with RuntimeError
+    with pytest.raises(RuntimeError, match="ACP process disconnected: test_disconnect"):
+        await t1
+
+    with pytest.raises(RuntimeError, match="ACP process disconnected: test_disconnect"):
+        await t2
+
+    # 4. Map must be completely cleared
+    assert len(kanaloa._pending_requests) == 0
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cleanup_idempotent_no_double_set(harness_env):
+    """
+    P1-01 Regression:
+    - Verifies _handle_disconnect is safe against double set_result / set_exception
+    - Multiple successive disconnect cleanup calls do not raise exceptions or crash.
+    """
+    store, mbx_mgr, coord, dispatcher = harness_env
+    kanaloa = MockWireKanaloaAdapter(event_handler=coord)
+
+    # Successive calls do not crash
+    await kanaloa._handle_disconnect(reason="first_disconnect")
+    await kanaloa._handle_disconnect(reason="second_disconnect")
+    await kanaloa.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_failure_cleans_up_and_allows_restart(harness_env, monkeypatch):
+    """
+    P1-03 Regression:
+    - If initialize handshake fails, child process and tasks are cleaned up.
+    - _is_initialized remains False, _process is set to None.
+    - Subsequent _ensure_process can start cleanly without orphan process leak.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    kanaloa = KanaloaAdapter(event_handler=coord)
+
+    call_count = 0
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = AsyncMock()
+            self.stdout = AsyncMock()
+            self.stderr = AsyncMock()
+            self.returncode = None
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+
+        async def wait(self):
+            return self.returncode
+
+    fake_proc1 = FakeProc()
+    fake_proc2 = FakeProc()
+
+    async def fake_create_subprocess(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return fake_proc1 if call_count == 1 else fake_proc2
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess)
+
+    # 1. First launch fails during initialize
+    async def fake_send_request(method, params=None):
+        if method == "initialize":
+            return {"error": {"message": "DSH init protocol failure"}}
+        return {}
+
+    monkeypatch.setattr(kanaloa, "_send_request", fake_send_request)
+
+    with pytest.raises(RuntimeError, match="ACP initialization failed"):
+        await kanaloa._ensure_process()
+
+    # Verify fail-closed cleanup: process terminated, reference set to None
+    assert fake_proc1.terminated is True
+    assert kanaloa._process is None
+    assert kanaloa._is_initialized is False
+
+    # 2. Second launch succeeds
+    async def fake_send_request_success(method, params=None):
+        if method == "initialize":
+            return {"result": {"agentInfo": {"name": "dsh", "version": "1.0.0"}}}
+        return {}
+
+    monkeypatch.setattr(kanaloa, "_send_request", fake_send_request_success)
+
+    await kanaloa._ensure_process()
+    assert kanaloa._is_initialized is True
+    assert kanaloa._process is fake_proc2
+    await kanaloa.close()
+
+
+@pytest.mark.asyncio
+async def test_resolved_permission_purged_and_stale_response_fails_closed(harness_env):
+    """
+    P2-02 Regression:
+    - Permission resolved -> purged from _pending_permissions map.
+    - Stale / repeated permission response -> fail-closed with Unknown permission request.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    kanaloa = MockWireKanaloaAdapter(event_handler=coord)
+    mock_stdin = MagicMock()
+    mock_stdin.write = MagicMock()
+    mock_stdin.drain = AsyncMock()
+    mock_process = MagicMock()
+    mock_process.stdin = mock_stdin
+    mock_process.returncode = None
+    kanaloa._process = mock_process
+    kanaloa._is_initialized = True
+
+    conv = Conversation(conversation_id="c_p2", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(turn_id="t_p2", conversation_id="c_p2", bound_agent_id="kanaloa", status="running", native_session_ref="s_p2")
+    store.save_turn(turn)
+    kanaloa.bind_session("t_p2", "s_p2")
+
+    await kanaloa._handle_incoming_rpc({
+        "jsonrpc": "2.0",
+        "id": 801,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "s_p2",
+            "toolCall": {"toolName": "danger_cmd"},
+        },
+    })
+    assert kanaloa.get_pending_permission(801) is not None
+
+    # Resolve
+    await kanaloa.respond_permission(801, "allow-once")
+
+    # Verify purged from pending map
+    assert kanaloa.get_pending_permission(801) is None
+    assert 801 not in kanaloa._pending_permissions
+
+    # Stale/duplicate response fails closed
+    with pytest.raises(ValueError, match="Unknown permission request '801'"):
+        await kanaloa.respond_permission(801, "allow-once")
+
+
+@pytest.mark.asyncio
+async def test_approval_resumes_via_emit_resumed_without_adapter_store_access(harness_env):
+    """
+    P1-02 Regression:
+    - Approval resolution transitions turn back to running via coord.emit_resumed.
+    - Adapter has ZERO store awareness: does not call or access store.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    kanaloa = MockWireKanaloaAdapter(event_handler=coord)
+    mock_stdin = MagicMock()
+    mock_stdin.write = MagicMock()
+    mock_stdin.drain = AsyncMock()
+    mock_process = MagicMock()
+    mock_process.stdin = mock_stdin
+    mock_process.returncode = None
+    kanaloa._process = mock_process
+    kanaloa._is_initialized = True
+
+    conv = Conversation(conversation_id="c_emit_res", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(turn_id="t_emit_res", conversation_id="c_emit_res", bound_agent_id="kanaloa", status="running", native_session_ref="s_res")
+    store.save_turn(turn)
+    kanaloa.bind_session("t_emit_res", "s_res")
+
+    await kanaloa._handle_incoming_rpc({
+        "jsonrpc": "2.0",
+        "id": 901,
+        "method": "session/request_permission",
+        "params": {"sessionId": "s_res", "toolCall": {"toolName": "write"}},
+    })
+    assert store.get_turn("t_emit_res").status == "waiting_user"
+
+    # Resolve permission
+    await kanaloa.respond_permission(901, "allow-once")
+
+    # Turn is back to running in store via Coordinator
+    assert store.get_turn("t_emit_res").status == "running"
+
+    # Adapter itself must have NO store reference
+    assert not hasattr(kanaloa, "store")
 
 
 

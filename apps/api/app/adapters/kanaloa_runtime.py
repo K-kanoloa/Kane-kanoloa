@@ -274,6 +274,7 @@ class KanaloaRuntime:
             "pending_steer": None,
         }
         self._active_loops[turn_id] = loop_meta
+        accumulated_text = ""
 
         try:
             while True:
@@ -287,12 +288,9 @@ class KanaloaRuntime:
                     logger.info("KanaloaRuntime: loop stopped before iteration %d for turn %s", iteration + 1, turn_id)
                     break
 
-                # 2. Check turn status in store before starting iteration
-                store = getattr(event_handler, "store", None)
-                if store:
-                    t_pre = store.get_turn(turn_id)
-                    if t_pre and t_pre.status in ("interrupted", "failed"):
-                        return
+                # Check if turn was externally marked inactive (interrupted, failed, or finished)
+                if hasattr(event_handler, "is_turn_active") and not event_handler.is_turn_active(turn_id):
+                    return
 
                 # Start 1 full work-cycle
                 iteration += 1
@@ -321,19 +319,16 @@ class KanaloaRuntime:
                     await event_handler.emit_interrupted(turn_id, reason="cancelled_by_acp")
                     return
 
-                # Check if turn was interrupted or failed during this iteration (e.g. disconnect)
-                if store:
-                    t_post = store.get_turn(turn_id)
-                    if t_post and t_post.status in ("interrupted", "failed"):
-                        logger.info("KanaloaRuntime: turn %s entered %s, halting loop", turn_id, t_post.status)
-                        return
+                # Check if turn was externally marked inactive during iteration execution
+                if hasattr(event_handler, "is_turn_active") and not event_handler.is_turn_active(turn_id):
+                    logger.info("KanaloaRuntime: turn %s is no longer active, halting loop", turn_id)
+                    return
 
                 # 3. Check for early completion: strict COMPLETE marker
                 iteration_text = "".join(self._iteration_outputs.get(turn_id, []))
-                turn_obj = store.get_turn(turn_id) if store else turn
-                full_output = (turn_obj.partial_output or "") if turn_obj else ""
+                accumulated_text += iteration_text
 
-                if self.is_complete_marker(iteration_text) or self.is_complete_marker(full_output):
+                if self.is_complete_marker(iteration_text) or self.is_complete_marker(accumulated_text):
                     logger.info(
                         "KanaloaRuntime: loop early complete detected at iteration %d for turn %s",
                         iteration,

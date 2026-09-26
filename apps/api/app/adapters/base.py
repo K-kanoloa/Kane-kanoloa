@@ -63,6 +63,15 @@ class AgentEventHandler(ABC):
         ...
 
     @abstractmethod
+    async def emit_resumed(
+        self,
+        turn_id: str,
+        reason: str | None = None,
+    ) -> None:
+        """Agent resumes execution (e.g. after approval response). Transitions Turn to 'running'."""
+        ...
+
+    @abstractmethod
     async def emit_interrupted(
         self,
         turn_id: str,
@@ -90,6 +99,13 @@ class AgentEventHandler(ABC):
         Enables Kane to dequeue and feed any pending safe-boundary steer inputs without exposing Mailbox to the Agent.
         """
         ...
+
+    def is_turn_active(self, turn_id: str) -> bool:
+        """
+        Query whether the turn is still in active lifecycle (running or waiting_user).
+        Allows runtime to inspect lifecycle fact via event contract without touching Store.
+        """
+        return True
 
 
 class BaseAdapter(ABC):
