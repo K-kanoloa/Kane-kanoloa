@@ -58,6 +58,11 @@ class BaseStore(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def get_message(self, message_id: str) -> Message | None:
+        """Fetch a single message by id."""
+        raise NotImplementedError
+
     # --- Turn Operations ---
     @abstractmethod
     def save_turn(self, turn: Turn) -> None:

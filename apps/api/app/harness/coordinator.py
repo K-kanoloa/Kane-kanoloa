@@ -1,0 +1,254 @@
+"""Kane vNext Harness Coordinator.
+
+Implements AgentEventHandler to process outbound facts from external Agents:
+- Ephemeral events (thinking, tool calls, status changes)
+- Streaming deltas (accumulated in Turn partial_output buffer)
+- Logical message finalization (ONE logical reply = ONE Message in store)
+- Lifecycle transitions (waiting_user, interrupted, failed)
+- Event subscriptions for UI / SSE streaming
+- Automatic dispatching of pending follow-up mailbox items
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any, Callable
+
+from ..adapters.base import AgentEventHandler, BaseAdapter
+from ..domain.models import EventType, Message, Turn, TurnEvent, current_iso
+from ..store.base import BaseStore
+from .mailbox import MailboxManager
+
+
+class HarnessCoordinator(AgentEventHandler):
+    """
+    Coordinates Agent outbound events, Turn lifecycle, and Store persistence.
+    """
+
+    def __init__(self, store: BaseStore, mailbox_manager: MailboxManager) -> None:
+        self.store = store
+        self.mailbox_manager = mailbox_manager
+        self._adapters: dict[str, BaseAdapter] = {}
+        self._listeners: dict[str, set[asyncio.Queue[TurnEvent]]] = {}
+        # Callback to trigger follow-up execution when turn finishes
+        self._followup_handler: Callable[[Turn, Message], Any] | None = None
+
+    def register_adapter(self, agent_id: str, adapter: BaseAdapter) -> None:
+        """Register an adapter and bind this coordinator as its event handler."""
+        self._adapters[agent_id] = adapter
+        adapter.bind_event_handler(self)
+
+    def get_adapter(self, agent_id: str) -> BaseAdapter:
+        if agent_id not in self._adapters:
+            raise KeyError(f"No adapter registered for agent '{agent_id}'")
+        return self._adapters[agent_id]
+
+    def has_adapter(self, agent_id: str) -> bool:
+        return agent_id in self._adapters
+
+    def set_followup_handler(self, handler: Callable[[Turn, Message], Any]) -> None:
+        """Set dispatcher callback to handle queued follow-up messages upon turn finish."""
+        self._followup_handler = handler
+
+    # --- Live Event Subscription (SSE / WebSockets) ---
+    def subscribe(self, turn_id: str) -> asyncio.Queue[TurnEvent]:
+        """Subscribe to live TurnEvents for a given turn."""
+        if turn_id not in self._listeners:
+            self._listeners[turn_id] = set()
+        queue: asyncio.Queue[TurnEvent] = asyncio.Queue()
+        self._listeners[turn_id].add(queue)
+        return queue
+
+    def unsubscribe(self, turn_id: str, queue: asyncio.Queue[TurnEvent]) -> None:
+        """Unsubscribe a queue from a turn's events."""
+        if turn_id in self._listeners:
+            self._listeners[turn_id].discard(queue)
+            if not self._listeners[turn_id]:
+                del self._listeners[turn_id]
+
+    def _broadcast_event(self, event: TurnEvent) -> None:
+        queues = self._listeners.get(event.turn_id, set())
+        for q in list(queues):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
+
+    # --- AgentEventHandler Implementation ---
+    async def emit_event(
+        self,
+        turn_id: str,
+        event_type: EventType,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit ephemeral runtime fact (thinking, tool progress, etc.)."""
+        turn = self.store.get_turn(turn_id)
+        if not turn:
+            raise ValueError(f"Turn '{turn_id}' not found")
+
+        event = TurnEvent(
+            turn_id=turn_id,
+            conversation_id=turn.conversation_id,
+            event_type=event_type,
+            payload=payload or {},
+        )
+        self.store.append_event(event)
+
+        turn.last_event_at = event.created_at
+        self.store.save_turn(turn)
+
+        self._broadcast_event(event)
+
+    async def emit_delta(self, turn_id: str, text: str) -> None:
+        """
+        Stream output delta. Aggregates into Turn partial_output buffer.
+        Deltas are ephemeral and NEVER become separate chat messages.
+        """
+        turn = self.store.get_turn(turn_id)
+        if not turn:
+            raise ValueError(f"Turn '{turn_id}' not found")
+
+        turn.partial_output = (turn.partial_output or "") + text
+        turn.last_event_at = current_iso()
+        self.store.save_turn(turn)
+
+        # Broadcast as ephemeral delta event
+        delta_event = TurnEvent(
+            turn_id=turn_id,
+            conversation_id=turn.conversation_id,
+            event_type="delta",
+            payload={"delta": text},
+        )
+        self._broadcast_event(delta_event)
+
+    async def emit_message_complete(
+        self,
+        turn_id: str,
+        content: str | None = None,
+        sender_id: str | None = None,
+    ) -> Message:
+        """
+        Signal completion of one logical reply.
+        Persists ONE permanent Message to store, clears partial_output,
+        and transitions Turn to 'finished'.
+        """
+        turn = self.store.get_turn(turn_id)
+        if not turn:
+            raise ValueError(f"Turn '{turn_id}' not found")
+
+        # Resolve final content: explicit content, or accumulated partial_output buffer
+        final_content = content if content is not None else (turn.partial_output or "")
+
+        message = Message(
+            conversation_id=turn.conversation_id,
+            sender="agent",
+            sender_id=sender_id or turn.bound_agent_id,
+            content=final_content,
+        )
+        self.store.append_message(message)
+
+        # Clear partial output buffer and mark finished
+        turn.partial_output = None
+        turn.status = "finished"
+        turn.finished_at = current_iso()
+        turn.last_event_at = current_iso()
+        self.store.save_turn(turn)
+
+        status_event = TurnEvent(
+            turn_id=turn_id,
+            conversation_id=turn.conversation_id,
+            event_type="status_change",
+            payload={
+                "status": "finished",
+                "message_id": message.message_id,
+            },
+        )
+        self.store.append_event(status_event)
+        self._broadcast_event(status_event)
+
+        # Check mailbox for pending follow-up items (e.g. from follow_up_only steer mode)
+        mailbox = self.mailbox_manager.get_mailbox(turn_id)
+        next_item = mailbox.get_nowait()
+        if next_item and next_item.item_type == "message":
+            msg_payload = next_item.payload
+            followup_msg_id = msg_payload.get("message_id")
+            if followup_msg_id:
+                # Retrieve the saved follow-up message
+                followup_msg = self.store.get_message(followup_msg_id)
+                if followup_msg and self._followup_handler:
+                    asyncio.create_task(self._followup_handler(turn, followup_msg))
+
+        return message
+
+    async def emit_waiting_user(
+        self,
+        turn_id: str,
+        prompt: str | None = None,
+    ) -> None:
+        """Agent pauses execution awaiting user input or approval."""
+        turn = self.store.get_turn(turn_id)
+        if not turn:
+            raise ValueError(f"Turn '{turn_id}' not found")
+
+        turn.status = "waiting_user"
+        turn.last_event_at = current_iso()
+        self.store.save_turn(turn)
+
+        status_event = TurnEvent(
+            turn_id=turn_id,
+            conversation_id=turn.conversation_id,
+            event_type="status_change",
+            payload={"status": "waiting_user", "prompt": prompt},
+        )
+        self.store.append_event(status_event)
+        self._broadcast_event(status_event)
+
+    async def emit_interrupted(
+        self,
+        turn_id: str,
+        reason: str,
+    ) -> None:
+        """Execution interrupted (network drop, cancel, process exit). Preserves partial_output."""
+        turn = self.store.get_turn(turn_id)
+        if not turn:
+            raise ValueError(f"Turn '{turn_id}' not found")
+
+        turn.status = "interrupted"
+        turn.interrupt_reason = reason
+        turn.last_event_at = current_iso()
+        # Note: turn.partial_output is preserved as-is (§31)
+        self.store.save_turn(turn)
+
+        status_event = TurnEvent(
+            turn_id=turn_id,
+            conversation_id=turn.conversation_id,
+            event_type="status_change",
+            payload={"status": "interrupted", "reason": reason},
+        )
+        self.store.append_event(status_event)
+        self._broadcast_event(status_event)
+
+    async def emit_failed(
+        self,
+        turn_id: str,
+        reason: str,
+    ) -> None:
+        """Execution encountered an unrecoverable failure."""
+        turn = self.store.get_turn(turn_id)
+        if not turn:
+            raise ValueError(f"Turn '{turn_id}' not found")
+
+        turn.status = "failed"
+        turn.interrupt_reason = reason
+        turn.last_event_at = current_iso()
+        turn.finished_at = current_iso()
+        self.store.save_turn(turn)
+
+        status_event = TurnEvent(
+            turn_id=turn_id,
+            conversation_id=turn.conversation_id,
+            event_type="status_change",
+            payload={"status": "failed", "reason": reason},
+        )
+        self.store.append_event(status_event)
+        self._broadcast_event(status_event)

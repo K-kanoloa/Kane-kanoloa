@@ -275,6 +275,16 @@ class SQLiteStore(BaseStore):
         ).fetchall()
         return [Message(**dict(r)) for r in rows]
 
+    def get_message(self, message_id: str) -> Message | None:
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM messages WHERE message_id = ?;",
+            (message_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return Message(**dict(row))
+
     # --- Turn Operations ---
     def save_turn(self, turn: Turn) -> None:
         conn = self._get_connection()
@@ -319,12 +329,13 @@ class SQLiteStore(BaseStore):
                 "completed": "finished",
                 "done": "finished",
                 "waiting": "waiting_user",
-                "paused": "waiting_user",
                 "error": "failed",
-                "aborted": "interrupted",
-                "stopped": "interrupted",
             }
-            data["status"] = legacy_map.get(str(status).lower(), "interrupted")
+            mapped = legacy_map.get(str(status).lower() if status is not None else "")
+            if mapped:
+                data["status"] = mapped
+            else:
+                raise ValueError(f"Invalid or unrecognized turn status: {status}")
         return data
 
     def get_turn(self, turn_id: str) -> Turn | None:

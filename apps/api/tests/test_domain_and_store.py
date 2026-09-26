@@ -5,6 +5,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from app.domain.models import (
     AgentBinding,
     AgentCapabilities,
@@ -301,7 +303,24 @@ def test_sqlite_schema_upgrade_and_legacy_status_compatibility():
             assert turn2 is not None
             assert turn2.status == "failed"
 
-            # 4. Verify we can now save partial_output to existing upgraded turn
+            # 4. Verify legacy status 'waiting' normalized to 'waiting_user'
+            raw_conn.execute(
+                "INSERT INTO turns (turn_id, conversation_id, bound_agent_id, status, last_event_at, created_at) "
+                "VALUES ('turn_legacy_3', 'conv_leg', 'kanaloa', 'waiting', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');"
+            )
+            turn3 = store.get_turn("turn_legacy_3")
+            assert turn3 is not None
+            assert turn3.status == "waiting_user"
+
+            # 5. Verify unrecognized or corrupted status raises ValueError instead of masking as interrupted
+            raw_conn.execute(
+                "INSERT INTO turns (turn_id, conversation_id, bound_agent_id, status, last_event_at, created_at) "
+                "VALUES ('turn_corrupt', 'conv_leg', 'kanaloa', 'non_existent_status', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');"
+            )
+            with pytest.raises(ValueError, match="Invalid or unrecognized turn status"):
+                store.get_turn("turn_corrupt")
+
+            # 6. Verify we can now save partial_output to existing upgraded turn
             turn1.partial_output = "Fresh partial output after migration"
             store.save_turn(turn1)
 
