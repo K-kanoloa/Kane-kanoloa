@@ -360,6 +360,85 @@ class SQLiteStore(BaseStore):
         ).fetchall()
         return [Turn(**self._normalize_turn_data(dict(r))) for r in rows]
 
+    def finalize_turn_completion(
+        self,
+        turn: Turn,
+        message: Message,
+        status_event: TurnEvent | None = None,
+    ) -> None:
+        """
+        Atomically persist final Message, clear Turn partial_output, set Turn status to finished,
+        and optionally append completion TurnEvent in a single ACID transaction.
+        """
+        conn = self._get_connection()
+        with conn:
+            # 1. Insert message
+            conn.execute(
+                """
+                INSERT INTO messages (
+                    message_id, conversation_id, sender, sender_id, reply_to,
+                    parent_id, content, kind, target_message_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    message.message_id,
+                    message.conversation_id,
+                    message.sender,
+                    message.sender_id,
+                    message.reply_to,
+                    message.parent_id,
+                    message.content,
+                    message.kind,
+                    message.target_message_id,
+                    message.created_at,
+                ),
+            )
+            # 2. Update turn atomically: clear partial_output, set finished status and finished_at
+            conn.execute(
+                """
+                INSERT INTO turns (
+                    turn_id, conversation_id, bound_agent_id, title, status,
+                    native_session_ref, last_event_at, interrupt_reason,
+                    partial_output, created_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(turn_id) DO UPDATE SET
+                    status = excluded.status,
+                    partial_output = NULL,
+                    last_event_at = excluded.last_event_at,
+                    finished_at = excluded.finished_at;
+                """,
+                (
+                    turn.turn_id,
+                    turn.conversation_id,
+                    turn.bound_agent_id,
+                    turn.title,
+                    turn.status,
+                    turn.native_session_ref,
+                    turn.last_event_at,
+                    turn.interrupt_reason,
+                    None,
+                    turn.created_at,
+                    turn.finished_at,
+                ),
+            )
+            # 3. Insert status event if provided
+            if status_event:
+                conn.execute(
+                    """
+                    INSERT INTO turn_events (
+                        event_id, turn_id, conversation_id, event_type, payload, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        status_event.event_id,
+                        status_event.turn_id,
+                        status_event.conversation_id,
+                        status_event.event_type,
+                        json.dumps(status_event.payload, ensure_ascii=False),
+                        status_event.created_at,
+                    ),
+                )
+
     # --- Turn Event Operations ---
     def append_event(self, event: TurnEvent) -> None:
         conn = self._get_connection()

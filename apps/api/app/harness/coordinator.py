@@ -145,14 +145,11 @@ class HarnessCoordinator(AgentEventHandler):
             sender_id=sender_id or turn.bound_agent_id,
             content=final_content,
         )
-        self.store.append_message(message)
-
-        # Clear partial output buffer and mark finished
+        # Update turn state and prepare completion status event
         turn.partial_output = None
         turn.status = "finished"
         turn.finished_at = current_iso()
         turn.last_event_at = current_iso()
-        self.store.save_turn(turn)
 
         status_event = TurnEvent(
             turn_id=turn_id,
@@ -163,7 +160,9 @@ class HarnessCoordinator(AgentEventHandler):
                 "message_id": message.message_id,
             },
         )
-        self.store.append_event(status_event)
+
+        # Single atomic ACID transaction: Message + Turn completion + Status event
+        self.store.finalize_turn_completion(turn, message, status_event)
         self._broadcast_event(status_event)
 
         # Check mailbox for pending follow-up items (e.g. from follow_up_only steer mode)

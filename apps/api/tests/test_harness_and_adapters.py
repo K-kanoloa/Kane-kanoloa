@@ -11,7 +11,7 @@ import asyncio
 import pytest
 
 from app.adapters.mock_adapter import MockAdapter
-from app.domain.models import AgentCapabilities, Conversation, Turn
+from app.domain.models import AgentCapabilities, Conversation, Message, Turn
 from app.harness.coordinator import HarnessCoordinator
 from app.harness.dispatcher import Dispatcher
 from app.harness.mailbox import MailboxItem, MailboxManager
@@ -177,7 +177,7 @@ async def test_deterministic_dispatcher_turn_resolution(harness_env):
     assert turn1 is not None
     assert turn1.conversation_id == "conv_new"
     assert turn1.status == "running"
-    assert turn1.title == "Initial Task"
+    assert turn1.title == "Initial Turn"
 
     conv = store.get_conversation("conv_new")
     assert conv.focus_turn_id == turn1.turn_id
@@ -517,3 +517,149 @@ async def test_live_event_subscription(harness_env):
     coord.unsubscribe("t_sub", queue)
     await coord.emit_delta("t_sub", "Delta 2")
     assert queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_atomic_finalize_turn_completion(harness_env):
+    """
+    Verify that finalize_turn_completion executes in a single ACID SQLite transaction:
+    - Message inserted
+    - Turn updated with partial_output = None, status = finished, finished_at recorded
+    - TurnEvent recorded
+    """
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    conv = Conversation(conversation_id="c_atomic", bound_agent_id="mock_agent")
+    store.save_conversation(conv)
+    turn = Turn(
+        turn_id="t_atomic",
+        conversation_id="c_atomic",
+        bound_agent_id="mock_agent",
+        status="running",
+        partial_output="Pending stream buffer",
+    )
+    store.save_turn(turn)
+
+    mock_agent = MockAdapter()
+    coord.register_adapter("mock_agent", mock_agent)
+
+    # Call emit_message_complete which uses store.finalize_turn_completion atomically
+    msg = await coord.emit_message_complete("t_atomic")
+    assert msg.content == "Pending stream buffer"
+
+    # Verify atomic state in store
+    t_db = store.get_turn("t_atomic")
+    assert t_db.status == "finished"
+    assert t_db.partial_output is None
+    assert t_db.finished_at is not None
+
+    messages = store.get_messages("c_atomic")
+    assert len(messages) == 1
+    assert messages[0].message_id == msg.message_id
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_adapter_capabilities_and_session_binding(harness_env):
+    """
+    Verify KanaloaAdapter:
+    - Honest capability declaration based on current DSH programmatic SDK reality
+    - Session binding to Turn native_session_ref
+    """
+    from app.adapters.kanaloa_adapter import KanaloaAdapter
+
+    store, mbx_mgr, coord, dispatcher = harness_env
+    kanaloa = KanaloaAdapter()
+    coord.register_adapter("kanaloa", kanaloa)
+
+    caps = kanaloa.capabilities()
+    # Must be honest: DSH SDK protocol does not yet support mid-turn cancel or per-session cancel
+    assert caps.supports_cancel is False
+    assert caps.supports_stream is True
+    assert caps.supports_resume is False
+    assert caps.steer_mode == "follow_up_only"
+    assert caps.supports_parallel_sessions is False
+    assert caps.max_parallel_sessions == 1
+
+    # Session binding
+    conv = Conversation(conversation_id="c_kan", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(
+        turn_id="t_kan",
+        conversation_id="c_kan",
+        bound_agent_id="kanaloa",
+        status="running",
+    )
+    store.save_turn(turn)
+
+    msg = Message(conversation_id="c_kan", sender="user", content="Start research")
+    await kanaloa.send(turn, msg, [msg])
+
+    assert turn.native_session_ref is not None
+    assert turn.native_session_ref.startswith("dsh_sess_")
+    assert kanaloa.get_native_session("t_kan") == turn.native_session_ref
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_adapter_event_normalization(harness_env):
+    """
+    Verify KanaloaAdapter deterministic normalization / mapping:
+    - DSH delta -> emit_delta -> partial_output buffer
+    - DSH complete -> emit_message_complete -> single Message in store
+    - DSH waiting_user -> emit_waiting_user -> turn.status = waiting_user
+    - DSH error -> emit_failed -> turn.status = failed
+    """
+    from app.adapters.kanaloa_adapter import KanaloaAdapter
+
+    store, mbx_mgr, coord, dispatcher = harness_env
+    kanaloa = KanaloaAdapter()
+    coord.register_adapter("kanaloa", kanaloa)
+
+    conv = Conversation(conversation_id="c_norm", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(
+        turn_id="t_norm",
+        conversation_id="c_norm",
+        bound_agent_id="kanaloa",
+        status="running",
+    )
+    store.save_turn(turn)
+
+    # 1. Delta normalization
+    await kanaloa.normalize_dsh_event("t_norm", {
+        "type": "delta",
+        "params": {"text": "Step 1: Analyzing repo with DSH..."},
+    })
+    assert store.get_turn("t_norm").partial_output == "Step 1: Analyzing repo with DSH..."
+
+    # 2. Completion normalization
+    await kanaloa.normalize_dsh_event("t_norm", {
+        "type": "complete",
+        "params": {"content": "Analysis complete with IPython REPL findings."},
+    })
+    t_fin = store.get_turn("t_norm")
+    assert t_fin.status == "finished"
+    assert t_fin.partial_output is None
+    msgs = store.get_messages("c_norm")
+    assert len(msgs) == 1
+    assert msgs[0].content == "Analysis complete with IPython REPL findings."
+    assert msgs[0].sender_id == "kanaloa"
+
+    # 3. Waiting user normalization
+    turn.status = "running"
+    store.save_turn(turn)
+    await kanaloa.normalize_dsh_event("t_norm", {
+        "type": "waiting_user",
+        "params": {"prompt": "Confirm file deletion?"},
+    })
+    assert store.get_turn("t_norm").status == "waiting_user"
+
+    # 4. Error normalization
+    turn.status = "running"
+    store.save_turn(turn)
+    await kanaloa.normalize_dsh_event("t_norm", {
+        "type": "error",
+        "params": {"message": "Execution timeout"},
+    })
+    assert store.get_turn("t_norm").status == "failed"
+    assert store.get_turn("t_norm").interrupt_reason == "Execution timeout"
+

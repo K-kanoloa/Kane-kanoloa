@@ -95,7 +95,7 @@ class Dispatcher:
                 conversation_id=conversation_id,
                 bound_agent_id=conv.bound_agent_id,
                 status="running",
-                title="Initial Task",
+                title="Initial Turn",
             )
             self.store.save_turn(new_turn)
 
@@ -108,12 +108,12 @@ class Dispatcher:
         raise ValueError(
             f"target_turn_required: conversation '{conversation_id}' already has existing turns, "
             f"but no target or focus turn could be resolved. "
-            f"Please specify an explicit target_turn_id or request a new task."
+            f"Please specify an explicit target_turn_id or request a new turn."
         )
 
     def create_new_turn(self, conversation_id: str, title: str | None = None) -> Turn:
         """
-        Explicitly create an additional independent Turn for a conversation (New Task).
+        Explicitly create an additional independent Turn for a conversation (New Turn).
         """
         conv = self.store.get_conversation(conversation_id)
         if not conv:
@@ -125,7 +125,7 @@ class Dispatcher:
             conversation_id=conversation_id,
             bound_agent_id=conv.bound_agent_id,
             status="running",
-            title=title or "New Task",
+            title=title or "New Turn",
         )
         self.store.save_turn(new_turn)
 

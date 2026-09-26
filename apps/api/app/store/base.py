@@ -79,6 +79,19 @@ class BaseStore(ABC):
         """List all turns belonging to a conversation."""
         raise NotImplementedError
 
+    @abstractmethod
+    def finalize_turn_completion(
+        self,
+        turn: Turn,
+        message: Message,
+        status_event: TurnEvent | None = None,
+    ) -> None:
+        """
+        Atomically persist final Message, clear Turn partial_output, set Turn status to finished,
+        and optionally append completion TurnEvent in a single ACID transaction.
+        """
+        raise NotImplementedError
+
     # --- Turn Event Operations ---
     @abstractmethod
     def append_event(self, event: TurnEvent) -> None:

@@ -4,7 +4,7 @@ Disciplines:
 - Causal Isolation: Mailbox is STRICTLY for INBOUND items entering a Turn:
   1. User messages (follow-ups or initial prompt)
   2. Steer inputs (for safe-boundary or follow-up steering)
-  3. Control signals (cancel / abort)
+  (Control signals like cancel/abort are out-of-band immediate calls and do NOT queue in Mailbox)
 - Mailbox MUST NOT contain or buffer Agent Outbound Events (thinking, delta, stream_done).
   Outbound events bypass Mailbox entirely and flow through AgentEventHandler / EventStream.
 """
@@ -18,7 +18,7 @@ from typing import Any, Literal
 
 from ..id_utils import new_id
 
-InboundItemType = Literal["message", "steer", "cancel"]
+InboundItemType = Literal["message", "steer"]
 
 
 @dataclass
