@@ -8,8 +8,10 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 import pytest
 
+from app.adapters.kanaloa_adapter import KanaloaAdapter
 from app.adapters.mock_adapter import MockAdapter
 from app.domain.models import AgentCapabilities, Conversation, Message, Turn
 from app.harness.coordinator import HarnessCoordinator
@@ -562,7 +564,7 @@ async def test_atomic_finalize_turn_completion(harness_env):
 async def test_kanaloa_adapter_capabilities_and_session_binding(harness_env):
     """
     Verify KanaloaAdapter:
-    - Honest capability declaration based on current DSH programmatic SDK reality
+    - Honest capability declaration based on verified DSH ACP transport
     - Session binding to Turn native_session_ref
     """
     from app.adapters.kanaloa_adapter import KanaloaAdapter
@@ -572,13 +574,14 @@ async def test_kanaloa_adapter_capabilities_and_session_binding(harness_env):
     coord.register_adapter("kanaloa", kanaloa)
 
     caps = kanaloa.capabilities()
-    # Must be honest: DSH SDK protocol does not yet support mid-turn cancel or per-session cancel
-    assert caps.supports_cancel is False
+    assert caps.supports_cancel is True
     assert caps.supports_stream is True
-    assert caps.supports_resume is False
+    assert caps.supports_resume is True
+    assert caps.supports_approval is True
+    assert caps.supports_parallel_sessions is True
+    assert caps.max_parallel_sessions is None
     assert caps.steer_mode == "follow_up_only"
-    assert caps.supports_parallel_sessions is False
-    assert caps.max_parallel_sessions == 1
+    assert caps.branch_mode == "unsupported"
 
     # Session binding
     conv = Conversation(conversation_id="c_kan", bound_agent_id="kanaloa")
@@ -591,27 +594,25 @@ async def test_kanaloa_adapter_capabilities_and_session_binding(harness_env):
     )
     store.save_turn(turn)
 
-    msg = Message(conversation_id="c_kan", sender="user", content="Start research")
-    await kanaloa.send(turn, msg, [msg])
-
-    assert turn.native_session_ref is not None
-    assert turn.native_session_ref.startswith("dsh_sess_")
-    assert kanaloa.get_native_session("t_kan") == turn.native_session_ref
+    kanaloa.bind_session("t_kan", "sess_kan_123")
+    assert kanaloa.get_native_session("t_kan") == "sess_kan_123"
 
 
 @pytest.mark.asyncio
 async def test_kanaloa_adapter_event_normalization(harness_env):
     """
-    Verify KanaloaAdapter deterministic normalization / mapping:
-    - DSH delta -> emit_delta -> partial_output buffer
-    - DSH complete -> emit_message_complete -> single Message in store
-    - DSH waiting_user -> emit_waiting_user -> turn.status = waiting_user
-    - DSH error -> emit_failed -> turn.status = failed
+    Verify KanaloaAdapter deterministic normalization of ACP session/update into Kane stable facts:
+    - content block text -> emit_delta -> partial_output buffer
+    - thought / thinking -> coarse live event {"status": "thinking"} (zero raw thought bloat into DB)
+    - tool events -> coarse tool event
+    - permission request -> emit_waiting_user -> turn.status = waiting_user
+    - prompt complete -> emit_message_complete -> single Message in store (sender_id="kanaloa")
+    - cancelled outcome -> emit_interrupted -> turn.status = interrupted
     """
     from app.adapters.kanaloa_adapter import KanaloaAdapter
 
     store, mbx_mgr, coord, dispatcher = harness_env
-    kanaloa = KanaloaAdapter()
+    kanaloa = KanaloaAdapter(event_handler=coord)
     coord.register_adapter("kanaloa", kanaloa)
 
     conv = Conversation(conversation_id="c_norm", bound_agent_id="kanaloa")
@@ -620,48 +621,73 @@ async def test_kanaloa_adapter_event_normalization(harness_env):
         turn_id="t_norm",
         conversation_id="c_norm",
         bound_agent_id="kanaloa",
+        native_session_ref="sess_norm_1",
         status="running",
     )
     store.save_turn(turn)
+    kanaloa.bind_session("t_norm", "sess_norm_1")
 
-    # 1. Delta normalization
-    await kanaloa.normalize_dsh_event("t_norm", {
-        "type": "delta",
-        "params": {"text": "Step 1: Analyzing repo with DSH..."},
+    # 1. Delta normalization via session/update
+    await kanaloa._handle_session_update({
+        "sessionId": "sess_norm_1",
+        "update": {
+            "type": "content",
+            "content": {"type": "text", "text": "Step 1: Analyzing repo with DSH..."},
+        },
     })
     assert store.get_turn("t_norm").partial_output == "Step 1: Analyzing repo with DSH..."
 
-    # 2. Completion normalization
-    await kanaloa.normalize_dsh_event("t_norm", {
-        "type": "complete",
-        "params": {"content": "Analysis complete with IPython REPL findings."},
+    # 2. Thinking normalization (coarse live status, not bloating turn_events)
+    await kanaloa._handle_session_update({
+        "sessionId": "sess_norm_1",
+        "update": {
+            "type": "thought",
+            "thought": "Deep reasoning intermediate steps...",
+        },
     })
+    events = store.list_events("t_norm")
+    assert any(e.event_type == "thinking" and e.payload.get("status") == "thinking" for e in events)
+
+    # 3. Tool event normalization
+    await kanaloa._handle_session_update({
+        "sessionId": "sess_norm_1",
+        "update": {
+            "type": "tool_call",
+            "toolName": "bash",
+            "status": "executing",
+        },
+    })
+    events = store.list_events("t_norm")
+    assert any(e.event_type == "tool_start" and e.payload.get("tool") == "bash" for e in events)
+
+    # 4. Permission request normalization
+    await kanaloa._handle_permission_request({
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "sess_norm_1",
+            "message": "Confirm file edit?",
+        },
+    })
+    assert store.get_turn("t_norm").status == "waiting_user"
+
+    # 5. Completion normalization
+    await kanaloa.event_handler.emit_message_complete(
+        turn_id="t_norm",
+        sender_id="kanaloa",
+    )
     t_fin = store.get_turn("t_norm")
     assert t_fin.status == "finished"
     assert t_fin.partial_output is None
     msgs = store.get_messages("c_norm")
     assert len(msgs) == 1
-    assert msgs[0].content == "Analysis complete with IPython REPL findings."
+    assert msgs[0].content == "Step 1: Analyzing repo with DSH..."
     assert msgs[0].sender_id == "kanaloa"
 
-    # 3. Waiting user normalization
+    # 6. Interrupted / Cancel normalization
     turn.status = "running"
     store.save_turn(turn)
-    await kanaloa.normalize_dsh_event("t_norm", {
-        "type": "waiting_user",
-        "params": {"prompt": "Confirm file deletion?"},
-    })
-    assert store.get_turn("t_norm").status == "waiting_user"
-
-    # 4. Error normalization
-    turn.status = "running"
-    store.save_turn(turn)
-    await kanaloa.normalize_dsh_event("t_norm", {
-        "type": "error",
-        "params": {"message": "Execution timeout"},
-    })
-    assert store.get_turn("t_norm").status == "failed"
-    assert store.get_turn("t_norm").interrupt_reason == "Execution timeout"
+    await kanaloa.event_handler.emit_interrupted("t_norm", reason="cancelled_by_acp")
+    assert store.get_turn("t_norm").status == "interrupted"
 
 
 @pytest.mark.asyncio
@@ -712,12 +738,47 @@ async def test_deterministic_message_turn_binding_and_reply_routing(harness_env)
     assert msg_reply_b.turn_id == "turn_b"
 
 
+class MockWireKanaloaAdapter(KanaloaAdapter):
+    """Test helper for wire-level Kanaloa ACP interactions without spawning real subprocess."""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.cancel_notifs: list[dict[str, Any] | None] = []
+        self.resumed_sessions: list[dict[str, Any] | None] = []
+        self.sent_requests: list[tuple[str, dict[str, Any] | None]] = []
+        self._new_session_id_counter = 1
+
+    async def _ensure_process(self) -> None:
+        self._is_initialized = True
+
+    async def _send_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
+        if method == "session/cancel":
+            self.cancel_notifs.append(params)
+
+    async def _send_request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        self.sent_requests.append((method, params))
+        if method == "initialize":
+            return {"result": {"agentInfo": {"name": "dsh-acp", "version": "0.0.1"}}}
+        if method == "session/new":
+            sess_id = f"acp_sess_{self._new_session_id_counter}"
+            self._new_session_id_counter += 1
+            return {"result": {"sessionId": sess_id}}
+        if method == "session/resume":
+            self.resumed_sessions.append(params)
+            return {"result": {"configOptions": []}}
+        if method == "session/prompt":
+            return {"result": {"stopReason": "end_turn"}}
+        if method == "session/close":
+            return {"result": {}}
+        return {"result": {}}
+
+
 @pytest.mark.asyncio
 async def test_strict_capability_gates_cancel_and_resume(harness_env):
     """
     Verify capability gates strictly block/raise instead of silently pretending success:
     - supports_cancel = False raises RuntimeError on cancel_turn
     - supports_resume = False raises RuntimeError on resume_turn
+    - KanaloaAdapter steer() raises NotImplementedError (honest follow_up_only declaration)
     """
     from app.adapters.kanaloa_adapter import KanaloaAdapter
 
@@ -740,37 +801,36 @@ async def test_strict_capability_gates_cancel_and_resume(harness_env):
     # Turn status must NOT be modified to interrupted
     assert store.get_turn("t_gate1").status == "running"
 
-    # 2. Adapter without resume support (like KanaloaAdapter)
-    kanaloa = KanaloaAdapter()
-    coord.register_adapter("kanaloa_gate", kanaloa)
+    # 2. Adapter without resume support
+    no_resume_agent = MockAdapter(
+        capabilities=AgentCapabilities(supports_cancel=True, supports_resume=False)
+    )
+    coord.register_adapter("agent_no_resume", no_resume_agent)
 
-    conv2 = Conversation(conversation_id="c_gate2", bound_agent_id="kanaloa_gate")
+    conv2 = Conversation(conversation_id="c_gate2", bound_agent_id="agent_no_resume")
     store.save_conversation(conv2)
-    turn2 = Turn(turn_id="t_gate2", conversation_id="c_gate2", bound_agent_id="kanaloa_gate", status="waiting_user")
+    turn2 = Turn(turn_id="t_gate2", conversation_id="c_gate2", bound_agent_id="agent_no_resume", status="waiting_user")
     store.save_turn(turn2)
 
     with pytest.raises(RuntimeError, match="does not support native resume"):
         await dispatcher.resume_turn("t_gate2")
 
-    # Direct adapter calls must also raise NotImplementedError
-    with pytest.raises(NotImplementedError):
-        await kanaloa.cancel(turn2)
-    with pytest.raises(NotImplementedError):
-        await kanaloa.resume(turn2, [])
+    # 3. Direct steer call on KanaloaAdapter must also raise NotImplementedError since steer_mode="follow_up_only"
+    kanaloa = KanaloaAdapter()
+    with pytest.raises(NotImplementedError, match="follow_up_only"):
+        await kanaloa.steer(turn2, Message(conversation_id="c_gate2", sender="user", content="steer"))
 
 
 @pytest.mark.asyncio
 async def test_kanaloa_adapter_incremental_vs_bootstrap_prompt(harness_env):
     """
-    Verify KanaloaAdapter dual-state prompt payload:
-    - Bootstrap state (new session or after reset): sends prompt + visible history replay
-    - Incremental state (active session): sends prompt ONLY (no history replay)
-    - Session reset / rebuild: re-attaches visible history context
+    Verify KanaloaAdapter dual-state prompt payload over ACP:
+    - Bootstrap state (new session or after reset): sends prompt + visible history context blocks
+    - Incremental state (active session): sends prompt ONLY (no history blocks repeated)
+    - Session reset / rebuild: re-attaches visible history context blocks
     """
-    from app.adapters.kanaloa_adapter import KanaloaAdapter
-
     store, mbx_mgr, coord, dispatcher = harness_env
-    kanaloa = KanaloaAdapter()
+    kanaloa = MockWireKanaloaAdapter(event_handler=coord)
     coord.register_adapter("kanaloa_proto", kanaloa)
 
     conv = Conversation(conversation_id="c_proto", bound_agent_id="kanaloa_proto")
@@ -795,38 +855,40 @@ async def test_kanaloa_adapter_incremental_vs_bootstrap_prompt(harness_env):
     assert kanaloa.last_sent_payload is not None
     payload1 = kanaloa.last_sent_payload
     assert payload1["method"] == "session/prompt"
-    assert payload1["params"]["session_id"] == "dsh_sess_t_proto"
-    assert payload1["params"]["prompt"] == "First question"
-    assert "history" in payload1["params"]
-    # Visible history contains prior message m0
-    hist = payload1["params"]["history"]
-    assert any(h["content"] == "System instruction: be concise" for h in hist)
+    assert payload1["params"]["sessionId"] == "acp_sess_1"
+    prompt_blocks1 = payload1["params"]["prompt"]
+    # Visible history contains prior message m0 as passive context block
+    assert any("[USER CONTEXT]: System instruction: be concise" in b.get("text", "") for b in prompt_blocks1)
+    # The active prompt is the new question
+    assert prompt_blocks1[-1]["text"] == "First question"
 
     # Simulate completion
-    await kanaloa.normalize_dsh_event("t_proto", {"type": "complete", "params": {"content": "Answer 1"}})
+    await kanaloa.event_handler.emit_message_complete(turn_id="t_proto", sender_id="kanaloa")
 
     # 2. Follow-up send on existing active session: Incremental State
     m2, _ = await dispatcher.dispatch_user_message("c_proto", "Follow-up question")
     payload2 = kanaloa.last_sent_payload
     assert payload2["method"] == "session/prompt"
-    assert payload2["params"]["session_id"] == "dsh_sess_t_proto"
-    assert payload2["params"]["prompt"] == "Follow-up question"
-    # No history repeated!
-    assert "history" not in payload2["params"]
+    assert payload2["params"]["sessionId"] == "acp_sess_1"
+    # No history repeated! Only the incremental new message block
+    prompt_blocks2 = payload2["params"]["prompt"]
+    assert len(prompt_blocks2) == 1
+    assert prompt_blocks2[0]["text"] == "Follow-up question"
 
     # Simulate completion before shutdown
-    await kanaloa.normalize_dsh_event("t_proto", {"type": "complete", "params": {"content": "Answer 2"}})
+    await kanaloa.event_handler.emit_message_complete(turn_id="t_proto", sender_id="kanaloa")
 
     # 3. Simulate process crash / session reset via close()
     await kanaloa.close()
     assert not kanaloa.is_alive()
 
-    # 4. Next send triggers Session Rebuild State with visible history
+    # 4. Next send triggers Session Rebuild State with visible history context blocks
     m3, _ = await dispatcher.dispatch_user_message("c_proto", "Question after restart")
     payload3 = kanaloa.last_sent_payload
     assert payload3["method"] == "session/prompt"
-    assert payload3["params"]["prompt"] == "Question after restart"
-    assert "history" in payload3["params"]
+    prompt_blocks3 = payload3["params"]["prompt"]
+    assert prompt_blocks3[-1]["text"] == "Question after restart"
+    assert any("[USER CONTEXT]:" in b.get("text", "") for b in prompt_blocks3)
 
 
 @pytest.mark.asyncio
@@ -838,11 +900,11 @@ async def test_session_rebuild_context_reconstruction_without_side_effect_replay
       MUST ONLY be reconstructed as passive context / transcript entries ({role, content}).
     - Historical messages MUST NEVER be placed in the executable prompt field or invoked as a command queue.
     - ONLY the single, newly dispatched user message is executed as the prompt.
+    - 0 mechanical replay / 0 command queue replay.
+    - External side-effect idempotency and approval policies remain governed by the Agent/Tool/Host layers.
     """
-    from app.adapters.kanaloa_adapter import KanaloaAdapter
-
     store, mbx_mgr, coord, dispatcher = harness_env
-    kanaloa = KanaloaAdapter()
+    kanaloa = MockWireKanaloaAdapter(event_handler=coord)
     coord.register_adapter("kanaloa_rebuild", kanaloa)
 
     conv = Conversation(conversation_id="c_side_effect", bound_agent_id="kanaloa_rebuild")
@@ -890,162 +952,56 @@ async def test_session_rebuild_context_reconstruction_without_side_effect_replay
     assert payload is not None
     assert payload["method"] == "session/prompt"
 
-    # CRITICAL CHECK 1: The executable prompt is STRICTLY and ONLY the current new input
-    assert payload["params"]["prompt"] == current_input
-    assert "rm -rf" not in payload["params"]["prompt"]
-    assert "git push" not in payload["params"]["prompt"]
+    prompt_blocks = payload["params"]["prompt"]
 
-    # CRITICAL CHECK 2: Historical messages with side effects are strictly passive transcript
-    history = payload["params"]["history"]
-    assert len(history) == 2
-    assert history[0]["role"] == "user"
-    assert history[0]["content"] == "rm -rf /tmp/build_cache && git push origin main"
-    assert history[1]["role"] == "agent"
-    assert history[1]["content"] == "Cleaned cache and pushed commit 92fff32 to origin."
+    # CRITICAL CHECK 1: The executable prompt is STRICTLY and ONLY the current new input
+    assert prompt_blocks[-1]["text"] == current_input
+    assert "rm -rf" not in prompt_blocks[-1]["text"]
+    assert "git push" not in prompt_blocks[-1]["text"]
+
+    # CRITICAL CHECK 2: Historical messages with side effects are strictly passive transcript blocks
+    assert prompt_blocks[0]["text"] == "[USER CONTEXT]: rm -rf /tmp/build_cache && git push origin main"
+    assert prompt_blocks[1]["text"] == "[AGENT CONTEXT]: Cleaned cache and pushed commit 92fff32 to origin."
 
     # CRITICAL CHECK 3: No execution loop or queue re-executed historical messages
     assert resumed_turn.status == "running"
 
 
 @pytest.mark.asyncio
-async def test_kanaloa_acp_adapter_capabilities():
-    """Verify KanaloaACPAdapter declares honest, verified ACP capabilities."""
-    from app.adapters.kanaloa_acp_adapter import KanaloaACPAdapter
-
-    adapter = KanaloaACPAdapter()
-    caps = adapter.capabilities()
-    assert caps.supports_stream is True
-    assert caps.supports_resume is True
-    assert caps.supports_cancel is True
-    assert caps.supports_approval is True
-    assert caps.supports_parallel_sessions is True
-    assert caps.max_parallel_sessions is None
-    assert caps.steer_mode == "follow_up_only"
-    assert caps.branch_mode == "unsupported"
-
-
-@pytest.mark.asyncio
-async def test_kanaloa_acp_adapter_event_normalization(harness_env):
+async def test_kanaloa_adapter_dispatcher_control_flows(harness_env):
     """
-    Verify ACP session/update and prompt outcome normalization into Kane stable facts:
-    - content block text -> emit_delta -> partial_output
-    - thought / tool events -> emit_event
-    - permission request -> emit_waiting_user
-    - cancelled stopReason -> emit_interrupted
+    Verify Dispatcher cancel and resume work seamlessly with KanaloaAdapter:
+    - Since supports_cancel=True, cancel_turn does NOT raise and completes cleanly via session/cancel
+    - Since supports_resume=True, resume_turn does NOT raise and invokes adapter.resume via session/resume
     """
-    from app.adapters.kanaloa_acp_adapter import KanaloaACPAdapter
-
-    store, mbx_mgr, coord, dispatcher = harness_env
-    acp = KanaloaACPAdapter(event_handler=coord)
-    coord.register_adapter("acp_agent", acp)
-
-    conv = Conversation(conversation_id="c_acp", bound_agent_id="acp_agent")
-    store.save_conversation(conv)
-    turn = Turn(
-        turn_id="t_acp",
-        conversation_id="c_acp",
-        bound_agent_id="acp_agent",
-        native_session_ref="sess_acp_1",
-        status="running",
-    )
-    store.save_turn(turn)
-    acp.bind_session("t_acp", "sess_acp_1")
-
-    # 1. Delta normalization via session/update
-    await acp._handle_session_update({
-        "sessionId": "sess_acp_1",
-        "update": {
-            "type": "content",
-            "content": {"type": "text", "text": "Streaming chunk 1..."},
-        },
-    })
-    assert store.get_turn("t_acp").partial_output == "Streaming chunk 1..."
-
-    # 2. Thought normalization
-    await acp._handle_session_update({
-        "sessionId": "sess_acp_1",
-        "update": {
-            "type": "thought",
-            "thought": "Deciding on optimal approach",
-        },
-    })
-    events = store.list_events("t_acp")
-    assert any(e.event_type == "thinking" for e in events)
-
-    # 3. Permission request normalization
-    await acp._handle_permission_request({
-        "method": "session/request_permission",
-        "params": {
-            "sessionId": "sess_acp_1",
-            "message": "Allow writing to disk?",
-        },
-    })
-    assert store.get_turn("t_acp").status == "waiting_user"
-
-    # 4. Cancel outcome normalization
-    turn.status = "running"
-    store.save_turn(turn)
-    await acp.event_handler.emit_interrupted("t_acp", reason="cancelled_by_acp")
-    assert store.get_turn("t_acp").status == "interrupted"
-
-
-@pytest.mark.asyncio
-async def test_kanaloa_acp_dispatcher_control_flows(harness_env):
-    """
-    Verify Dispatcher cancel and resume work seamlessly with KanaloaACPAdapter:
-    - Since supports_cancel=True, cancel_turn does NOT raise and completes cleanly
-    - Since supports_resume=True, resume_turn does NOT raise and invokes adapter.resume
-    """
-    from app.adapters.kanaloa_acp_adapter import KanaloaACPAdapter
-
     store, mbx_mgr, coord, dispatcher = harness_env
 
-    # Subclass to mock wire calls without launching external process in unit test
-    class MockWireACPAdapter(KanaloaACPAdapter):
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-            self.cancel_notifs = []
-            self.resumed_sessions = []
+    mock_kanaloa = MockWireKanaloaAdapter(event_handler=coord)
+    coord.register_adapter("kanaloa_ctrl", mock_kanaloa)
 
-        async def _ensure_process(self):
-            self._is_initialized = True
-
-        async def _send_notification(self, method: str, params: dict | None = None):
-            if method == "session/cancel":
-                self.cancel_notifs.append(params)
-
-        async def _send_request(self, method: str, params: dict | None = None):
-            if method == "session/resume":
-                self.resumed_sessions.append(params)
-                return {"result": {"configOptions": []}}
-            return {"result": {}}
-
-    mock_acp = MockWireACPAdapter(event_handler=coord)
-    coord.register_adapter("acp_mock", mock_acp)
-
-    conv = Conversation(conversation_id="c_acp_ctrl", bound_agent_id="acp_mock")
+    conv = Conversation(conversation_id="c_ctrl", bound_agent_id="kanaloa_ctrl")
     store.save_conversation(conv)
     turn = Turn(
-        turn_id="t_acp_ctrl",
-        conversation_id="c_acp_ctrl",
-        bound_agent_id="acp_mock",
+        turn_id="t_ctrl",
+        conversation_id="c_ctrl",
+        bound_agent_id="kanaloa_ctrl",
         native_session_ref="sess_wire_1",
         status="running",
     )
     store.save_turn(turn)
-    mock_acp.bind_session("t_acp_ctrl", "sess_wire_1")
+    mock_kanaloa.bind_session("t_ctrl", "sess_wire_1")
 
     # 1. Cancel active turn
-    cancelled = await dispatcher.cancel_turn("t_acp_ctrl", reason="user_stop")
+    cancelled = await dispatcher.cancel_turn("t_ctrl", reason="user_stop")
     assert cancelled.status == "interrupted"
-    assert len(mock_acp.cancel_notifs) == 1
-    assert mock_acp.cancel_notifs[0]["sessionId"] == "sess_wire_1"
+    assert len(mock_kanaloa.cancel_notifs) == 1
+    assert mock_kanaloa.cancel_notifs[0]["sessionId"] == "sess_wire_1"
 
     # 2. Resume turn natively
-    resumed = await dispatcher.resume_turn("t_acp_ctrl")
+    resumed = await dispatcher.resume_turn("t_ctrl")
     assert resumed.status == "running"
-    assert len(mock_acp.resumed_sessions) == 1
-    assert mock_acp.resumed_sessions[0]["sessionId"] == "sess_wire_1"
+    assert len(mock_kanaloa.resumed_sessions) == 1
+    assert mock_kanaloa.resumed_sessions[0]["sessionId"] == "sess_wire_1"
 
 
 
