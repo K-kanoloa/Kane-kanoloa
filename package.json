@@ -32,9 +32,11 @@
         "test:api": "node scripts/run-python.mjs apps/api -m pytest -q",
         "test:bridge": "node scripts/run-python.mjs apps/local-bridge -m pytest -q"
     },
-    "devDependencies": {
+    "dependencies": {
         "@deepseek-ai/dsh": "0.1.5-rc.3",
-        "@deepseek-ai/dsh-acp": "0.1.5-rc.3",
+        "@deepseek-ai/dsh-acp": "0.1.5-rc.3"
+    },
+    "devDependencies": {
         "concurrently": "^9.2.1",
         "playwright": "^1.59.1"
     }
