@@ -106,8 +106,6 @@ class KanaloaAdapter(BaseAdapter):
         self._lock = asyncio.Lock()
         self._pending_permissions: dict[str, PendingPermissionRequest] = {}
         self.runtime = KanaloaRuntime()
-        self._active_loops: dict[str, dict[str, Any]] = {}
-        self._iteration_outputs: dict[str, list[str]] = {}
 
         # Audit properties for testing & verification
         self.last_sent_payload: dict[str, Any] | None = None
@@ -283,8 +281,7 @@ class KanaloaAdapter(BaseAdapter):
                 text = content_block.get("text", "")
                 if text:
                     await self.event_handler.emit_delta(turn_id, text)
-                    if turn_id in self._iteration_outputs:
-                        self._iteration_outputs[turn_id].append(text)
+                    self.runtime.record_delta(turn_id, text)
         elif update_type in ("thought", "thinking"):
             # Coarse live thinking status/event for UI; does NOT dump massive raw reasoning chains into turn_events
             thought_text = update.get("thought") or update.get("content", "")
@@ -495,12 +492,7 @@ class KanaloaAdapter(BaseAdapter):
 
     async def close(self) -> None:
         """Clean up active sessions and shutdown ACP process."""
-        # 1. Invalidate active loops and purge pending permissions & runtimes fail-closed
-        for loop_meta in self._active_loops.values():
-            loop_meta["cancelled"] = True
-        self._active_loops.clear()
-        self._iteration_outputs.clear()
-
+        # 1. Invalidate pending permissions, loops & runtimes fail-closed
         await self._handle_disconnect(reason="adapter_closed", purge=False)
 
         # 2. Close active sessions gracefully
@@ -634,9 +626,33 @@ class KanaloaAdapter(BaseAdapter):
 
         # Dispatch prompt in background so send() returns while prompt streams
         if max_iterations is not _UNSET:
-            asyncio.create_task(self._execute_loop(turn, session_id, prompt_blocks, max_iterations))
+            asyncio.create_task(
+                self.runtime.execute_loop(
+                    turn=turn,
+                    session_id=session_id,
+                    initial_prompt_blocks=prompt_blocks,
+                    max_iterations=max_iterations,
+                    send_prompt_fn=self._send_prompt_for_loop,
+                    event_handler=self.event_handler,
+                )
+            )
         else:
             asyncio.create_task(self._execute_prompt(turn.turn_id, session_id, prompt_blocks))
+
+    async def _send_prompt_for_loop(
+        self,
+        session_id: str,
+        prompt_blocks: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], str | None]:
+        """Low-level protocol transport executing one work-cycle prompt over ACP stdio."""
+        resp = await self._send_request("session/prompt", {
+            "sessionId": session_id,
+            "prompt": prompt_blocks,
+        })
+        result = resp.get("result", {})
+        stop_reason = result.get("stopReason")
+        self.last_stop_reason = stop_reason
+        return resp, stop_reason
 
     async def _execute_prompt(self, turn_id: str, session_id: str, prompt_blocks: list[dict[str, Any]]) -> None:
         """Execute session/prompt and normalize completion/cancellation outcome in Normal Mode."""
@@ -666,122 +682,9 @@ class KanaloaAdapter(BaseAdapter):
             logger.error("KanaloaAdapter prompt execution exception: %s", e)
             await self.event_handler.emit_failed(turn_id, reason=str(e))
 
-    async def _execute_loop(
-        self,
-        turn: Turn,
-        session_id: str,
-        initial_prompt_blocks: list[dict[str, Any]],
-        max_iterations: int | None,
-    ) -> None:
-        """
-        Optional Loop Mode execution over DSH ACP stdio.
-        Governed strictly by single field max_iterations: int | None.
-        Runs work iterations until COMPLETE, max_iterations reached, or interrupted/cancelled.
-        Emits single emit_message_complete upon completion.
-        """
-        turn_id = turn.turn_id
-        current_prompt = initial_prompt_blocks
-        iteration = 0
-        loop_meta: dict[str, Any] = {
-            "session_id": session_id,
-            "max_iterations": max_iterations,
-            "current_iteration": 0,
-            "cancelled": False,
-        }
-        self._active_loops[turn_id] = loop_meta
-
-        try:
-            while True:
-                # 1. Check if cancelled before starting iteration
-                if loop_meta.get("cancelled"):
-                    await self.event_handler.emit_interrupted(turn_id, reason="cancelled")
-                    return
-
-                iteration += 1
-                loop_meta["current_iteration"] = iteration
-                logger.info(
-                    "KanaloaAdapter: starting loop iteration %d (max: %s) for turn %s (session %s)",
-                    iteration,
-                    max_iterations,
-                    turn_id,
-                    session_id,
-                )
-
-                # Reset iteration output accumulator
-                self._iteration_outputs[turn_id] = []
-
-                # 2. Execute one work iteration via session/prompt
-                resp = await self._send_request("session/prompt", {
-                    "sessionId": session_id,
-                    "prompt": current_prompt,
-                })
-
-                if "error" in resp:
-                    err_msg = resp["error"].get("message", "ACP prompt error in loop")
-                    await self.event_handler.emit_failed(turn_id, reason=str(err_msg))
-                    return
-
-                result = resp.get("result", {})
-                stop_reason = result.get("stopReason")
-                self.last_stop_reason = stop_reason
-
-                # Check if cancelled mid-flight
-                if stop_reason == "cancelled" or loop_meta.get("cancelled"):
-                    await self.event_handler.emit_interrupted(turn_id, reason="cancelled_by_acp")
-                    return
-
-                # Check turn status in store in case it was interrupted/failed externally
-                if hasattr(self.event_handler, "store") and self.event_handler.store:
-                    t = self.event_handler.store.get_turn(turn_id)
-                    if t and t.status in ("interrupted", "failed"):
-                        return
-
-                # 3. Check for early completion: output contains 'COMPLETE'
-                iteration_text = "".join(self._iteration_outputs.get(turn_id, []))
-                store = getattr(self.event_handler, "store", None)
-                turn_obj = store.get_turn(turn_id) if store else turn
-                full_output = (turn_obj.partial_output or "") if turn_obj else ""
-
-                is_complete = "COMPLETE" in iteration_text or "COMPLETE" in full_output
-
-                if is_complete:
-                    logger.info(
-                        "KanaloaAdapter: loop early complete detected at iteration %d for turn %s",
-                        iteration,
-                        turn_id,
-                    )
-                    break
-
-                # 4. Check if max_iterations limit reached
-                if max_iterations is not None and iteration >= max_iterations:
-                    logger.info(
-                        "KanaloaAdapter: loop reached max_iterations (%d) for turn %s",
-                        max_iterations,
-                        turn_id,
-                    )
-                    break
-
-                # 5. Prepare prompt for next iteration
-                pending_steer = loop_meta.pop("pending_steer", None)
-                if pending_steer:
-                    current_prompt = [{"type": "text", "text": pending_steer}]
-                else:
-                    current_prompt = [{
-                        "type": "text",
-                        "text": "Continue with next step. Output 'COMPLETE' when finished.",
-                    }]
-
-            # Loop finished normally
-            await self.event_handler.emit_message_complete(
-                turn_id=turn_id,
-                sender_id="kanaloa",
-            )
-        except Exception as e:
-            logger.error("KanaloaAdapter: loop execution exception: %s", e)
-            await self.event_handler.emit_failed(turn_id, reason=str(e))
-        finally:
-            self._active_loops.pop(turn_id, None)
-            self._iteration_outputs.pop(turn_id, None)
+    def stop_loop(self, turn: Turn) -> None:
+        """Signal runtime to gracefully stop continuing loop after current iteration."""
+        self.runtime.stop_loop(turn.turn_id)
 
     async def steer(
         self,
@@ -802,8 +705,7 @@ class KanaloaAdapter(BaseAdapter):
                 f"Cannot steer turn '{turn.turn_id}': turn has terminal status '{turn.status}'"
             )
 
-        if turn.turn_id in self._active_loops:
-            self._active_loops[turn.turn_id]["pending_steer"] = message.content
+        self.runtime.record_steer(turn.turn_id, message.content)
 
         resp = await self._send_request("session/steer", {
             "sessionId": session_id,
@@ -830,9 +732,8 @@ class KanaloaAdapter(BaseAdapter):
             logger.warning("KanaloaAdapter: cancel requested but no native_session_ref on turn %s", turn.turn_id)
             return
 
-        # Mark active loop as cancelled
-        if turn.turn_id in self._active_loops:
-            self._active_loops[turn.turn_id]["cancelled"] = True
+        # Mark active loop as cancelled in runtime
+        self.runtime.cancel_loop(turn.turn_id)
 
         # Invalidate any pending permissions for this session fail-closed
         await self._handle_disconnect(session_id=session_id, reason="session_cancelled")
