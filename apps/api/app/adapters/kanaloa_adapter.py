@@ -46,12 +46,17 @@ class KanaloaAdapter(BaseAdapter):
         self.command = command or ["npx", "@deepseek-ai/dsh", "--stdio"]
         self._process: asyncio.subprocess.Process | None = None
         self._turn_sessions: dict[str, str] = {}  # turn_id -> native_session_id
+        self._active_sessions: set[str] = set()    # Active session IDs that have received prompt bootstrap
+        self.last_sent_payload: dict[str, Any] | None = None
         self._is_running = False
 
     def capabilities(self) -> AgentCapabilities:
         """
         Honest capability declaration based on verified DSH SDK wire protocol.
         Does NOT inflate capabilities that the transport cannot deliver.
+        - supports_cancel = False (DSH SDK wire protocol currently lacks per-session/mid-turn cancel)
+        - supports_resume = False (Native resume unsupported; Continue uses session rebuild via send())
+        - steer_mode = 'follow_up_only' (Safe boundary is a Generic BaseAdapter feature; SDK uses follow_up_only)
         """
         return AgentCapabilities(
             supports_stream=True,
@@ -79,6 +84,7 @@ class KanaloaAdapter(BaseAdapter):
 
     async def close(self) -> None:
         self._is_running = False
+        self._active_sessions.clear()
         if self._process and self._process.returncode is None:
             try:
                 self._process.terminate()
@@ -134,22 +140,58 @@ class KanaloaAdapter(BaseAdapter):
     ) -> None:
         """
         Format prompt request into DSH programmatic stdio JSON-RPC.
-        Session reference is recorded on the Turn.
+
+        Two deterministic prompt payload states:
+        - State A (Active Session): If session is already active and process is alive,
+          send ONLY incremental message (do NOT repeat full history).
+        - State B (Bootstrap / Session Rebuild): If session is new or rebuilt,
+          replay visible history context along with the new message.
         """
         # Ensure session binding
         if not turn.native_session_ref:
             turn.native_session_ref = f"dsh_sess_{turn.turn_id}"
             self.bind_session(turn.turn_id, turn.native_session_ref)
 
+        session_ref = turn.native_session_ref
         self._is_running = True
 
-        # In production this writes JSON-RPC `session/prompt` to self._process.stdin
-        # In adapter layer, it translates Kane message history to DSH prompt payload
-        logger.debug(
-            "KanaloaAdapter: sending prompt to DSH session %s for turn %s",
-            turn.native_session_ref,
-            turn.turn_id,
-        )
+        if session_ref in self._active_sessions and self.is_alive():
+            # State A: Existing active native session -> incremental message only
+            payload = {
+                "method": "session/prompt",
+                "params": {
+                    "session_id": session_ref,
+                    "prompt": message.content,
+                },
+            }
+            logger.debug(
+                "KanaloaAdapter: sending incremental prompt to active DSH session %s for turn %s",
+                session_ref,
+                turn.turn_id,
+            )
+        else:
+            # State B: Fresh bootstrap or rebuilt session -> replay visible history context
+            self._active_sessions.add(session_ref)
+            payload = {
+                "method": "session/prompt",
+                "params": {
+                    "session_id": session_ref,
+                    "prompt": message.content,
+                    "history": [
+                        {"role": m.sender, "content": m.content}
+                        for m in history
+                        if m.message_id != message.message_id
+                    ],
+                },
+            }
+            logger.debug(
+                "KanaloaAdapter: bootstrapping DSH session %s with %d history messages for turn %s",
+                session_ref,
+                len(payload["params"]["history"]),
+                turn.turn_id,
+            )
+
+        self.last_sent_payload = payload
 
     async def steer(
         self,
@@ -168,20 +210,21 @@ class KanaloaAdapter(BaseAdapter):
     ) -> None:
         """
         DSH SDK wire protocol currently lacks per-session cancel.
-        If emergency process stop is needed, terminates process; otherwise logs capability limitation.
+        Raises NotImplementedError to enforce capability honesty.
         """
         logger.warning(
-            "KanaloaAdapter: cancel requested for turn %s, but current DSH SDK lacks per-session cancel.",
+            "KanaloaAdapter: cancel requested for turn %s, but DSH SDK lacks per-session cancel.",
             turn.turn_id,
         )
+        raise NotImplementedError("KanaloaAdapter (SDK): DSH SDK wire protocol does not support per-session cancellation.")
 
     async def resume(
         self,
         turn: Turn,
         history: list[Message],
     ) -> None:
-        """Resume execution for an interrupted or waiting turn."""
-        if not turn.native_session_ref:
-            turn.native_session_ref = f"dsh_sess_{turn.turn_id}"
-            self.bind_session(turn.turn_id, turn.native_session_ref)
-        self._is_running = True
+        """
+        Native resume is not supported under DSH SDK wire protocol.
+        Continue / follow-up is handled via send(turn, user_msg, history).
+        """
+        raise NotImplementedError("KanaloaAdapter (SDK): DSH SDK wire protocol does not support native resume.")

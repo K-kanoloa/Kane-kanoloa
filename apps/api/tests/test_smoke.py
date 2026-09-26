@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from app.main import app
 from app.security.url_safety import is_safe_http_url
-from app.store.file_store import FileStore
+from app.store.sqlite_store import SQLiteStore
 
 
 def test_api_imports_and_creates_app():
@@ -52,23 +52,11 @@ def test_url_safety_utility():
     assert is_safe_http_url("ftp://example.com") is False
 
 
-class DummyItem(BaseModel):
-    item_id: str
-    name: str
-
-
-def test_file_store_generic_infrastructure():
+def test_sqlite_store_smoke():
     with tempfile.TemporaryDirectory(prefix="kane-store-test-") as tmpdir:
-        store_path = Path(tmpdir) / "test_items.json"
-        store = FileStore(path=store_path, model=DummyItem, id_field="item_id")
-
-        items = store.list()
-        assert items == []
-
-        item = DummyItem(item_id="item_1", name="first")
-        store.upsert(item)
-
-        loaded = store.get("item_1")
-        assert loaded is not None
-        assert loaded.name == "first"
-        assert len(store.list()) == 1
+        db_path = Path(tmpdir) / "smoke.db"
+        store = SQLiteStore(db_path=db_path)
+        try:
+            assert store.list_conversations() == []
+        finally:
+            store.close()

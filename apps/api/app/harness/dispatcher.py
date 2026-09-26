@@ -73,13 +73,20 @@ class Dispatcher:
 
         # 2. Reply-to message
         if reply_to_message_id:
+            msg_turn_id = self.store.get_turn_id_by_message_id(reply_to_message_id)
+            if msg_turn_id:
+                target_turn = self.store.get_turn(msg_turn_id)
+                if target_turn and target_turn.conversation_id == conversation_id:
+                    return target_turn
             msg = self.store.get_message(reply_to_message_id)
-            if msg:
-                # If conversation has a focus turn, verify it
-                if conv.focus_turn_id:
-                    focus = self.store.get_turn(conv.focus_turn_id)
-                    if focus:
-                        return focus
+            if msg and msg.turn_id:
+                target_turn = self.store.get_turn(msg.turn_id)
+                if target_turn and target_turn.conversation_id == conversation_id:
+                    return target_turn
+            if msg and conv.focus_turn_id:
+                focus = self.store.get_turn(conv.focus_turn_id)
+                if focus:
+                    return focus
 
         # 3. Focus turn on conversation
         if conv.focus_turn_id:
@@ -145,19 +152,10 @@ class Dispatcher:
     ) -> tuple[Message, Turn]:
         """
         Dispatch a user message to the conversation and target Turn.
-        Appends user message to store (Append-only Truth), resolves turn, and routes.
+        Resolves turn deterministically, appends user message with bound turn_id to store,
+        and routes according to adapter capabilities.
         """
-        # 1. Append User Message
-        user_msg = Message(
-            conversation_id=conversation_id,
-            sender="user",
-            reply_to=reply_to_message_id,
-            parent_id=parent_id,
-            content=content,
-        )
-        self.store.append_message(user_msg)
-
-        # 2. Deterministic Turn Resolution
+        # 1. Deterministic Turn Resolution first
         if is_new_task:
             turn = self.create_new_turn(conversation_id)
         else:
@@ -166,6 +164,17 @@ class Dispatcher:
                 explicit_turn_id=target_turn_id,
                 reply_to_message_id=reply_to_message_id,
             )
+
+        # 2. Append User Message with explicit turn_id
+        user_msg = Message(
+            conversation_id=conversation_id,
+            turn_id=turn.turn_id,
+            sender="user",
+            reply_to=reply_to_message_id,
+            parent_id=parent_id,
+            content=content,
+        )
+        self.store.append_message(user_msg)
 
         # 3. Resolve Adapter and Capabilities
         adapter = self.coordinator.get_adapter(turn.bound_agent_id)
@@ -237,28 +246,40 @@ class Dispatcher:
         await adapter.send(turn, followup_msg, history)
 
     async def cancel_turn(self, turn_id: str, reason: str = "cancelled_by_user") -> Turn:
-        """Abort/cancel an active Turn."""
+        """Abort/cancel an active Turn. Enforces supports_cancel capability gate."""
         turn = self.store.get_turn(turn_id)
         if not turn:
             raise ValueError(f"Turn '{turn_id}' not found")
 
         adapter = self.coordinator.get_adapter(turn.bound_agent_id)
+        caps = adapter.capabilities()
+        if not caps.supports_cancel:
+            raise RuntimeError(
+                f"Agent adapter '{turn.bound_agent_id}' does not support cancellation"
+            )
+
         await adapter.cancel(turn)
         await self.coordinator.emit_interrupted(turn_id, reason=reason)
         return self.store.get_turn(turn_id)  # Refresh from store
 
     async def resume_turn(self, turn_id: str) -> Turn:
-        """Resume an interrupted or waiting Turn."""
+        """Resume an interrupted or waiting Turn natively. Enforces supports_resume capability gate."""
         turn = self.store.get_turn(turn_id)
         if not turn:
             raise ValueError(f"Turn '{turn_id}' not found")
+
+        adapter = self.coordinator.get_adapter(turn.bound_agent_id)
+        caps = adapter.capabilities()
+        if not caps.supports_resume:
+            raise RuntimeError(
+                f"Agent adapter '{turn.bound_agent_id}' does not support native resume"
+            )
 
         turn.status = "running"
         turn.interrupt_reason = None
         turn.last_event_at = current_iso()
         self.store.save_turn(turn)
 
-        adapter = self.coordinator.get_adapter(turn.bound_agent_id)
         history = self.store.get_messages(turn.conversation_id)
         await adapter.resume(turn, history)
         return self.store.get_turn(turn_id)

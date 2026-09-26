@@ -51,15 +51,19 @@ def test_message_append_only_and_edit_semantics():
     m1 = Message(
         message_id="msg_1",
         conversation_id=conv_id,
+        turn_id="turn_test_1",
         sender="user",
         content="今天去悉尼",
     )
     store.append_message(m1)
+    assert store.get_turn_id_by_message_id("msg_1") == "turn_test_1"
+    assert store.get_turn_id_by_message_id("msg_nonexistent") is None
 
     # M2: Edit operation - does NOT overwrite M1, appends as event log entry
     m2 = Message(
         message_id="msg_2",
         conversation_id=conv_id,
+        turn_id="turn_test_1",
         sender="user",
         parent_id="msg_1",
         kind="edit",
@@ -72,10 +76,12 @@ def test_message_append_only_and_edit_semantics():
     assert len(messages) == 2
     # Original message record is preserved untouched
     assert messages[0].message_id == "msg_1"
+    assert messages[0].turn_id == "turn_test_1"
     assert messages[0].content == "今天去悉尼"
     assert messages[0].kind == "normal"
     # Edit message is appended
     assert messages[1].message_id == "msg_2"
+    assert messages[1].turn_id == "turn_test_1"
     assert messages[1].content == "明天去悉尼"
     assert messages[1].kind == "edit"
     assert messages[1].target_message_id == "msg_1"

@@ -33,6 +33,7 @@ class Message(BaseModel):
     """
     message_id: str = Field(default_factory=lambda: new_id("msg"))
     conversation_id: str
+    turn_id: str | None = None  # Thin deterministic binding to Turn
     sender: MessageSender
     sender_id: str | None = None
     reply_to: str | None = None

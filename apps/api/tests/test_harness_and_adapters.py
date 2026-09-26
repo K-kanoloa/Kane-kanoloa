@@ -663,3 +663,168 @@ async def test_kanaloa_adapter_event_normalization(harness_env):
     assert store.get_turn("t_norm").status == "failed"
     assert store.get_turn("t_norm").interrupt_reason == "Execution timeout"
 
+
+@pytest.mark.asyncio
+async def test_deterministic_message_turn_binding_and_reply_routing(harness_env):
+    """
+    Verify Message -> Turn deterministic binding:
+    - User message gets turn_id bound upon dispatch
+    - reply_to_message_id resolves deterministically to the target Turn via store.get_turn_id_by_message_id
+    - Zero NLP, zero heuristic guessing
+    """
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    mock_agent = MockAdapter()
+    coord.register_adapter("mock_agent", mock_agent)
+
+    conv = Conversation(conversation_id="c_determ", bound_agent_id="mock_agent")
+    store.save_conversation(conv)
+
+    turn_a = Turn(turn_id="turn_a", conversation_id="c_determ", bound_agent_id="mock_agent", status="running")
+    turn_b = Turn(turn_id="turn_b", conversation_id="c_determ", bound_agent_id="mock_agent", status="running")
+    store.save_turn(turn_a)
+    store.save_turn(turn_b)
+
+    # 1. Dispatch explicit message to turn_a
+    msg_a, res_a = await dispatcher.dispatch_user_message("c_determ", "Message for A", target_turn_id="turn_a")
+    assert res_a.turn_id == "turn_a"
+    assert msg_a.turn_id == "turn_a"
+    assert store.get_turn_id_by_message_id(msg_a.message_id) == "turn_a"
+
+    # 2. Dispatch explicit message to turn_b
+    msg_b, res_b = await dispatcher.dispatch_user_message("c_determ", "Message for B", target_turn_id="turn_b")
+    assert res_b.turn_id == "turn_b"
+    assert msg_b.turn_id == "turn_b"
+    assert store.get_turn_id_by_message_id(msg_b.message_id) == "turn_b"
+
+    # 3. Dispatch replying to msg_a without target_turn_id -> Must route deterministically to turn_a!
+    msg_reply_a, res_reply_a = await dispatcher.dispatch_user_message(
+        "c_determ", "Followup replying to A", reply_to_message_id=msg_a.message_id
+    )
+    assert res_reply_a.turn_id == "turn_a"
+    assert msg_reply_a.turn_id == "turn_a"
+
+    # 4. Dispatch replying to msg_b without target_turn_id -> Must route deterministically to turn_b!
+    msg_reply_b, res_reply_b = await dispatcher.dispatch_user_message(
+        "c_determ", "Followup replying to B", reply_to_message_id=msg_b.message_id
+    )
+    assert res_reply_b.turn_id == "turn_b"
+    assert msg_reply_b.turn_id == "turn_b"
+
+
+@pytest.mark.asyncio
+async def test_strict_capability_gates_cancel_and_resume(harness_env):
+    """
+    Verify capability gates strictly block/raise instead of silently pretending success:
+    - supports_cancel = False raises RuntimeError on cancel_turn
+    - supports_resume = False raises RuntimeError on resume_turn
+    """
+    from app.adapters.kanaloa_adapter import KanaloaAdapter
+
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    # 1. Adapter without cancel support
+    no_cancel_agent = MockAdapter(
+        capabilities=AgentCapabilities(supports_cancel=False, supports_resume=True)
+    )
+    coord.register_adapter("agent_no_cancel", no_cancel_agent)
+
+    conv1 = Conversation(conversation_id="c_gate1", bound_agent_id="agent_no_cancel")
+    store.save_conversation(conv1)
+    turn1 = Turn(turn_id="t_gate1", conversation_id="c_gate1", bound_agent_id="agent_no_cancel", status="running")
+    store.save_turn(turn1)
+
+    with pytest.raises(RuntimeError, match="does not support cancellation"):
+        await dispatcher.cancel_turn("t_gate1")
+
+    # Turn status must NOT be modified to interrupted
+    assert store.get_turn("t_gate1").status == "running"
+
+    # 2. Adapter without resume support (like KanaloaAdapter)
+    kanaloa = KanaloaAdapter()
+    coord.register_adapter("kanaloa_gate", kanaloa)
+
+    conv2 = Conversation(conversation_id="c_gate2", bound_agent_id="kanaloa_gate")
+    store.save_conversation(conv2)
+    turn2 = Turn(turn_id="t_gate2", conversation_id="c_gate2", bound_agent_id="kanaloa_gate", status="waiting_user")
+    store.save_turn(turn2)
+
+    with pytest.raises(RuntimeError, match="does not support native resume"):
+        await dispatcher.resume_turn("t_gate2")
+
+    # Direct adapter calls must also raise NotImplementedError
+    with pytest.raises(NotImplementedError):
+        await kanaloa.cancel(turn2)
+    with pytest.raises(NotImplementedError):
+        await kanaloa.resume(turn2, [])
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_adapter_incremental_vs_bootstrap_prompt(harness_env):
+    """
+    Verify KanaloaAdapter dual-state prompt payload:
+    - Bootstrap state (new session or after reset): sends prompt + visible history replay
+    - Incremental state (active session): sends prompt ONLY (no history replay)
+    - Session reset / rebuild: re-attaches visible history context
+    """
+    from app.adapters.kanaloa_adapter import KanaloaAdapter
+
+    store, mbx_mgr, coord, dispatcher = harness_env
+    kanaloa = KanaloaAdapter()
+    coord.register_adapter("kanaloa_proto", kanaloa)
+
+    conv = Conversation(conversation_id="c_proto", bound_agent_id="kanaloa_proto")
+    store.save_conversation(conv)
+
+    turn = Turn(
+        turn_id="t_proto",
+        conversation_id="c_proto",
+        bound_agent_id="kanaloa_proto",
+        status="finished",
+    )
+    store.save_turn(turn)
+    conv.focus_turn_id = "t_proto"
+    store.save_conversation(conv)
+
+    # Prior historical message
+    m0 = Message(conversation_id="c_proto", turn_id="t_proto", sender="user", content="System instruction: be concise")
+    store.append_message(m0)
+
+    # 1. First send: Bootstrap State (session is new, not yet active in memory)
+    m1, _ = await dispatcher.dispatch_user_message("c_proto", "First question")
+    assert kanaloa.last_sent_payload is not None
+    payload1 = kanaloa.last_sent_payload
+    assert payload1["method"] == "session/prompt"
+    assert payload1["params"]["session_id"] == "dsh_sess_t_proto"
+    assert payload1["params"]["prompt"] == "First question"
+    assert "history" in payload1["params"]
+    # Visible history contains prior message m0
+    hist = payload1["params"]["history"]
+    assert any(h["content"] == "System instruction: be concise" for h in hist)
+
+    # Simulate completion
+    await kanaloa.normalize_dsh_event("t_proto", {"type": "complete", "params": {"content": "Answer 1"}})
+
+    # 2. Follow-up send on existing active session: Incremental State
+    m2, _ = await dispatcher.dispatch_user_message("c_proto", "Follow-up question")
+    payload2 = kanaloa.last_sent_payload
+    assert payload2["method"] == "session/prompt"
+    assert payload2["params"]["session_id"] == "dsh_sess_t_proto"
+    assert payload2["params"]["prompt"] == "Follow-up question"
+    # No history repeated!
+    assert "history" not in payload2["params"]
+
+    # Simulate completion before shutdown
+    await kanaloa.normalize_dsh_event("t_proto", {"type": "complete", "params": {"content": "Answer 2"}})
+
+    # 3. Simulate process crash / session reset via close()
+    await kanaloa.close()
+    assert not kanaloa.is_alive()
+
+    # 4. Next send triggers Session Rebuild State with visible history
+    m3, _ = await dispatcher.dispatch_user_message("c_proto", "Question after restart")
+    payload3 = kanaloa.last_sent_payload
+    assert payload3["method"] == "session/prompt"
+    assert payload3["params"]["prompt"] == "Question after restart"
+    assert "history" in payload3["params"]
+

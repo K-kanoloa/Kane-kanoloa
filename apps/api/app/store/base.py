@@ -63,6 +63,11 @@ class BaseStore(ABC):
         """Fetch a single message by id."""
         raise NotImplementedError
 
+    @abstractmethod
+    def get_turn_id_by_message_id(self, message_id: str) -> str | None:
+        """Deterministically resolve the turn_id that a message belongs to."""
+        raise NotImplementedError
+
     # --- Turn Operations ---
     @abstractmethod
     def save_turn(self, turn: Turn) -> None:

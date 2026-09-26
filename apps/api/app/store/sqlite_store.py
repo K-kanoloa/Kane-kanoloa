@@ -69,6 +69,7 @@ class SQLiteStore(BaseStore):
                 CREATE TABLE IF NOT EXISTS messages (
                     message_id TEXT PRIMARY KEY,
                     conversation_id TEXT NOT NULL,
+                    turn_id TEXT,
                     sender TEXT NOT NULL,
                     sender_id TEXT,
                     reply_to TEXT,
@@ -84,6 +85,12 @@ class SQLiteStore(BaseStore):
                 """
                 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id
                 ON messages (conversation_id, created_at);
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_messages_turn_id
+                ON messages (turn_id);
                 """
             )
             conn.execute(
@@ -147,6 +154,12 @@ class SQLiteStore(BaseStore):
             if "partial_output" not in existing_columns:
                 conn.execute("ALTER TABLE turns ADD COLUMN partial_output TEXT;")
 
+            cursor_msg = conn.execute("PRAGMA table_info(messages);")
+            existing_msg_cols = {row["name"] for row in cursor_msg.fetchall()}
+            if "turn_id" not in existing_msg_cols:
+                conn.execute("ALTER TABLE messages ADD COLUMN turn_id TEXT;")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_turn_id ON messages (turn_id);")
+
     # --- Conversation Operations ---
     def save_conversation(self, conversation: Conversation) -> None:
         conn = self._get_connection()
@@ -199,13 +212,14 @@ class SQLiteStore(BaseStore):
             conn.execute(
                 """
                 INSERT INTO messages (
-                    message_id, conversation_id, sender, sender_id, reply_to,
+                    message_id, conversation_id, turn_id, sender, sender_id, reply_to,
                     parent_id, content, kind, target_message_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     message.message_id,
                     message.conversation_id,
+                    message.turn_id,
                     message.sender,
                     message.sender_id,
                     message.reply_to,
@@ -284,6 +298,16 @@ class SQLiteStore(BaseStore):
         if not row:
             return None
         return Message(**dict(row))
+
+    def get_turn_id_by_message_id(self, message_id: str) -> str | None:
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT turn_id FROM messages WHERE message_id = ?;",
+            (message_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return row["turn_id"]
 
     # --- Turn Operations ---
     def save_turn(self, turn: Turn) -> None:
@@ -371,18 +395,20 @@ class SQLiteStore(BaseStore):
         and optionally append completion TurnEvent in a single ACID transaction.
         """
         conn = self._get_connection()
+        turn_id = message.turn_id or turn.turn_id
         with conn:
             # 1. Insert message
             conn.execute(
                 """
                 INSERT INTO messages (
-                    message_id, conversation_id, sender, sender_id, reply_to,
+                    message_id, conversation_id, turn_id, sender, sender_id, reply_to,
                     parent_id, content, kind, target_message_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     message.message_id,
                     message.conversation_id,
+                    turn_id,
                     message.sender,
                     message.sender_id,
                     message.reply_to,
