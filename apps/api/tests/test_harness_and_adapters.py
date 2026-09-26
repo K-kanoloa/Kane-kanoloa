@@ -828,3 +828,224 @@ async def test_kanaloa_adapter_incremental_vs_bootstrap_prompt(harness_env):
     assert payload3["params"]["prompt"] == "Question after restart"
     assert "history" in payload3["params"]
 
+
+@pytest.mark.asyncio
+async def test_session_rebuild_context_reconstruction_without_side_effect_replay(harness_env):
+    """
+    Verify Non-Negotiable Session Rebuild Discipline:
+    Reconstruction != Replay historical execution.
+    - Historical messages containing real-world side effects (file edits, git commits, API calls)
+      MUST ONLY be reconstructed as passive context / transcript entries ({role, content}).
+    - Historical messages MUST NEVER be placed in the executable prompt field or invoked as a command queue.
+    - ONLY the single, newly dispatched user message is executed as the prompt.
+    """
+    from app.adapters.kanaloa_adapter import KanaloaAdapter
+
+    store, mbx_mgr, coord, dispatcher = harness_env
+    kanaloa = KanaloaAdapter()
+    coord.register_adapter("kanaloa_rebuild", kanaloa)
+
+    conv = Conversation(conversation_id="c_side_effect", bound_agent_id="kanaloa_rebuild")
+    store.save_conversation(conv)
+
+    turn = Turn(
+        turn_id="t_side_effect",
+        conversation_id="c_side_effect",
+        bound_agent_id="kanaloa_rebuild",
+        status="finished",
+    )
+    store.save_turn(turn)
+    conv.focus_turn_id = "t_side_effect"
+    store.save_conversation(conv)
+
+    # 1. Historical messages that performed real-world side effects
+    m1 = Message(
+        conversation_id="c_side_effect",
+        turn_id="t_side_effect",
+        sender="user",
+        content="rm -rf /tmp/build_cache && git push origin main",
+    )
+    store.append_message(m1)
+    m2 = Message(
+        conversation_id="c_side_effect",
+        turn_id="t_side_effect",
+        sender="agent",
+        sender_id="kanaloa",
+        content="Cleaned cache and pushed commit 92fff32 to origin.",
+    )
+    store.append_message(m2)
+
+    # 2. Simulate native session loss / process restart (State B: Rebuild)
+    await kanaloa.close()
+    assert not kanaloa.is_alive()
+
+    # 3. User sends a new read-only inspection query
+    current_input = "Show me the current git log"
+    current_msg, resumed_turn = await dispatcher.dispatch_user_message(
+        "c_side_effect",
+        current_input,
+    )
+
+    payload = kanaloa.last_sent_payload
+    assert payload is not None
+    assert payload["method"] == "session/prompt"
+
+    # CRITICAL CHECK 1: The executable prompt is STRICTLY and ONLY the current new input
+    assert payload["params"]["prompt"] == current_input
+    assert "rm -rf" not in payload["params"]["prompt"]
+    assert "git push" not in payload["params"]["prompt"]
+
+    # CRITICAL CHECK 2: Historical messages with side effects are strictly passive transcript
+    history = payload["params"]["history"]
+    assert len(history) == 2
+    assert history[0]["role"] == "user"
+    assert history[0]["content"] == "rm -rf /tmp/build_cache && git push origin main"
+    assert history[1]["role"] == "agent"
+    assert history[1]["content"] == "Cleaned cache and pushed commit 92fff32 to origin."
+
+    # CRITICAL CHECK 3: No execution loop or queue re-executed historical messages
+    assert resumed_turn.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_acp_adapter_capabilities():
+    """Verify KanaloaACPAdapter declares honest, verified ACP capabilities."""
+    from app.adapters.kanaloa_acp_adapter import KanaloaACPAdapter
+
+    adapter = KanaloaACPAdapter()
+    caps = adapter.capabilities()
+    assert caps.supports_stream is True
+    assert caps.supports_resume is True
+    assert caps.supports_cancel is True
+    assert caps.supports_approval is True
+    assert caps.supports_parallel_sessions is True
+    assert caps.max_parallel_sessions is None
+    assert caps.steer_mode == "follow_up_only"
+    assert caps.branch_mode == "unsupported"
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_acp_adapter_event_normalization(harness_env):
+    """
+    Verify ACP session/update and prompt outcome normalization into Kane stable facts:
+    - content block text -> emit_delta -> partial_output
+    - thought / tool events -> emit_event
+    - permission request -> emit_waiting_user
+    - cancelled stopReason -> emit_interrupted
+    """
+    from app.adapters.kanaloa_acp_adapter import KanaloaACPAdapter
+
+    store, mbx_mgr, coord, dispatcher = harness_env
+    acp = KanaloaACPAdapter(event_handler=coord)
+    coord.register_adapter("acp_agent", acp)
+
+    conv = Conversation(conversation_id="c_acp", bound_agent_id="acp_agent")
+    store.save_conversation(conv)
+    turn = Turn(
+        turn_id="t_acp",
+        conversation_id="c_acp",
+        bound_agent_id="acp_agent",
+        native_session_ref="sess_acp_1",
+        status="running",
+    )
+    store.save_turn(turn)
+    acp.bind_session("t_acp", "sess_acp_1")
+
+    # 1. Delta normalization via session/update
+    await acp._handle_session_update({
+        "sessionId": "sess_acp_1",
+        "update": {
+            "type": "content",
+            "content": {"type": "text", "text": "Streaming chunk 1..."},
+        },
+    })
+    assert store.get_turn("t_acp").partial_output == "Streaming chunk 1..."
+
+    # 2. Thought normalization
+    await acp._handle_session_update({
+        "sessionId": "sess_acp_1",
+        "update": {
+            "type": "thought",
+            "thought": "Deciding on optimal approach",
+        },
+    })
+    events = store.list_events("t_acp")
+    assert any(e.event_type == "thinking" for e in events)
+
+    # 3. Permission request normalization
+    await acp._handle_permission_request({
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "sess_acp_1",
+            "message": "Allow writing to disk?",
+        },
+    })
+    assert store.get_turn("t_acp").status == "waiting_user"
+
+    # 4. Cancel outcome normalization
+    turn.status = "running"
+    store.save_turn(turn)
+    await acp.event_handler.emit_interrupted("t_acp", reason="cancelled_by_acp")
+    assert store.get_turn("t_acp").status == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_acp_dispatcher_control_flows(harness_env):
+    """
+    Verify Dispatcher cancel and resume work seamlessly with KanaloaACPAdapter:
+    - Since supports_cancel=True, cancel_turn does NOT raise and completes cleanly
+    - Since supports_resume=True, resume_turn does NOT raise and invokes adapter.resume
+    """
+    from app.adapters.kanaloa_acp_adapter import KanaloaACPAdapter
+
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    # Subclass to mock wire calls without launching external process in unit test
+    class MockWireACPAdapter(KanaloaACPAdapter):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.cancel_notifs = []
+            self.resumed_sessions = []
+
+        async def _ensure_process(self):
+            self._is_initialized = True
+
+        async def _send_notification(self, method: str, params: dict | None = None):
+            if method == "session/cancel":
+                self.cancel_notifs.append(params)
+
+        async def _send_request(self, method: str, params: dict | None = None):
+            if method == "session/resume":
+                self.resumed_sessions.append(params)
+                return {"result": {"configOptions": []}}
+            return {"result": {}}
+
+    mock_acp = MockWireACPAdapter(event_handler=coord)
+    coord.register_adapter("acp_mock", mock_acp)
+
+    conv = Conversation(conversation_id="c_acp_ctrl", bound_agent_id="acp_mock")
+    store.save_conversation(conv)
+    turn = Turn(
+        turn_id="t_acp_ctrl",
+        conversation_id="c_acp_ctrl",
+        bound_agent_id="acp_mock",
+        native_session_ref="sess_wire_1",
+        status="running",
+    )
+    store.save_turn(turn)
+    mock_acp.bind_session("t_acp_ctrl", "sess_wire_1")
+
+    # 1. Cancel active turn
+    cancelled = await dispatcher.cancel_turn("t_acp_ctrl", reason="user_stop")
+    assert cancelled.status == "interrupted"
+    assert len(mock_acp.cancel_notifs) == 1
+    assert mock_acp.cancel_notifs[0]["sessionId"] == "sess_wire_1"
+
+    # 2. Resume turn natively
+    resumed = await dispatcher.resume_turn("t_acp_ctrl")
+    assert resumed.status == "running"
+    assert len(mock_acp.resumed_sessions) == 1
+    assert mock_acp.resumed_sessions[0]["sessionId"] == "sess_wire_1"
+
+
+

@@ -145,7 +145,12 @@ class KanaloaAdapter(BaseAdapter):
         - State A (Active Session): If session is already active and process is alive,
           send ONLY incremental message (do NOT repeat full history).
         - State B (Bootstrap / Session Rebuild): If session is new or rebuilt,
-          replay visible history context along with the new message.
+          RECONSTRUCTION != REPLAY HISTORICAL EXECUTION.
+          Historical messages are passed ONLY as passive context / transcript ({role, content}),
+          NEVER as an executable command queue.
+          Only the current new message (message.content) is executed as the active prompt,
+          guaranteeing that historical operations with real-world side effects
+          (file modifications, git commits, emails, external API writes) are NEVER re-executed.
         """
         # Ensure session binding
         if not turn.native_session_ref:
@@ -170,7 +175,9 @@ class KanaloaAdapter(BaseAdapter):
                 turn.turn_id,
             )
         else:
-            # State B: Fresh bootstrap or rebuilt session -> replay visible history context
+            # State B: Fresh bootstrap or rebuilt session -> reconstruct context transcript only.
+            # CRITICAL DISCIPLINE: Only message.content is the active executable prompt.
+            # Past messages in history are passive read-only transcript, NEVER re-executed.
             self._active_sessions.add(session_ref)
             payload = {
                 "method": "session/prompt",
