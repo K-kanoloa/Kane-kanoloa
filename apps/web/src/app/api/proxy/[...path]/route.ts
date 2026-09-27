@@ -1,31 +1,41 @@
-import { NextResponse } from "next/server";
-
 import { getApiBaseUrl } from "@/lib/api";
 
-export async function POST(
-  req: Request,
-  { params }: { params: Promise<{ path: string[] }> }
-) {
+export const dynamic = "force-dynamic";
+
+async function proxy(req: Request, { params }: { params: Promise<{ path: string[] }> }) {
   const { path } = await params;
-  const apiBase = getApiBaseUrl();
-  const url = `${apiBase}/${path.join("/")}`;
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": req.headers.get("content-type") ?? "application/json",
-    },
-    body: req.body ? await req.text() : undefined,
-    cache: "no-store",
-  });
-
-  // If backend returns JSON, keep it; otherwise just pass status.
-  const text = await res.text();
-  const isJson = (res.headers.get("content-type") ?? "").includes("application/json");
-
-  if (isJson) {
-    return NextResponse.json(JSON.parse(text), { status: res.status });
+  if (!(path[0] === "api" && path[1] === "v1") && path.join("/") !== "health") {
+    return Response.json({ detail: "Unknown API path" }, { status: 404 });
   }
-  return new NextResponse(text, { status: res.status });
+  const incoming = new URL(req.url);
+  if (req.method === "POST" && req.headers.get("origin")) {
+    let originHost: string;
+    try { originHost = new URL(req.headers.get("origin")!).host; }
+    catch { return Response.json({ detail: "Invalid request origin" }, { status: 403 }); }
+    if (originHost !== req.headers.get("host")) return Response.json({ detail: "Cross-origin request rejected" }, { status: 403 });
+  }
+  const headers = new Headers({ Accept: req.headers.get("accept") ?? "application/json" });
+  const authorization = req.headers.get("authorization");
+  const token = req.headers.get("x-api-key") ?? process.env.OCTOPUS_API_TOKEN;
+  if (authorization) headers.set("Authorization", authorization);
+  if (token) headers.set("X-Api-Key", token);
+  if (req.method === "POST") headers.set("Content-Type", "application/json");
+  try {
+    const response = await fetch(`${getApiBaseUrl()}/${path.map(encodeURIComponent).join("/")}${incoming.search}`, {
+      method: req.method,
+      headers,
+      body: req.method === "POST" ? await req.text() : undefined,
+      cache: "no-store",
+      signal: req.signal,
+    });
+    return new Response(response.body, {
+      status: response.status,
+      headers: { "Content-Type": response.headers.get("content-type") ?? "application/json", "Cache-Control": "no-store", "X-Accel-Buffering": "no" },
+    });
+  } catch {
+    return Response.json({ detail: "Kane API is unavailable" }, { status: 502 });
+  }
 }
 
+export const GET = proxy;
+export const POST = proxy;

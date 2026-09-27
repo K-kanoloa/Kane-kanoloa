@@ -54,7 +54,7 @@ async function checkEndpoint(label, url) {
   return { label, url, status: response.status, elapsedMs, statusValue: json?.status ?? null };
 }
 
-async function checkWebSkeleton(page) {
+async function checkWebWorkspace(page) {
   const url = `${webBase}/`;
   const badResponses = [];
   const failedRequests = [];
@@ -93,14 +93,15 @@ async function checkWebSkeleton(page) {
     const elapsedMs = Math.round(performance.now() - started);
     await page.waitForTimeout(2000);
 
-    assert(response?.ok(), `Web skeleton navigation failed: ${response?.status() ?? "no_response"}`);
+    assert(response?.ok(), `Web workspace navigation failed: ${response?.status() ?? "no_response"}`);
 
     const bodyText = await page.locator("body").innerText({ timeout: 10000 });
-    assert(/Kane vNext/i.test(bodyText), "Web skeleton did not render 'Kane vNext' title");
-    assert(!errorTextPatterns.some((pattern) => pattern.test(bodyText)), "Web skeleton rendered API error text");
-    assert(badResponses.length === 0, `Web skeleton had bad HTTP responses (>=400): ${JSON.stringify(badResponses)}`);
-    assert(failedRequests.length === 0, `Web skeleton had failed requests: ${JSON.stringify(failedRequests)}`);
-    assert(consoleErrors.length === 0, `Web skeleton had console errors: ${JSON.stringify(consoleErrors.slice(0, 3))}`);
+    await page.locator(".workspace #conversation-main").waitFor({ state: "visible" });
+    assert(/Kane/i.test(bodyText), "Web workspace did not render Kane branding");
+    assert(!errorTextPatterns.some((pattern) => pattern.test(bodyText)), "Web workspace rendered API error text");
+    assert(badResponses.length === 0, `Web workspace had bad HTTP responses (>=400): ${JSON.stringify(badResponses)}`);
+    assert(failedRequests.length === 0, `Web workspace had failed requests: ${JSON.stringify(failedRequests)}`);
+    assert(consoleErrors.length === 0, `Web workspace had console errors: ${JSON.stringify(consoleErrors.slice(0, 3))}`);
 
     return { path: "/", status: response.status(), elapsedMs, ok: true };
   } finally {
@@ -112,7 +113,7 @@ async function checkWebSkeleton(page) {
 }
 
 async function main() {
-  console.log("=== Kane vNext Phase 1 Smoke Test ===");
+  console.log("=== Kane vNext Stack Smoke Test ===");
 
   // 1. Check API /health
   const apiHealth = await checkEndpoint("api:health", `${apiBase}/health`);
@@ -122,7 +123,7 @@ async function main() {
   const bridgeHealth = await checkEndpoint("bridge:health", `${bridgeBase}/health`);
   console.log(`[PASS] Bridge health: ${bridgeHealth.status} (${bridgeHealth.elapsedMs}ms)`);
 
-  // 3. Check Web Skeleton via Playwright
+  // Read-only workspace check; agent execution belongs to test:e2e:ui.
   let chromium;
   try {
     const playwright = await import("playwright");
@@ -134,16 +135,16 @@ async function main() {
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage();
-    const webResult = await checkWebSkeleton(page);
-    console.log(`[PASS] Web skeleton loaded: HTTP ${webResult.status} (${webResult.elapsedMs}ms), 0 console errors, 0 bad responses`);
+    const webResult = await checkWebWorkspace(page);
+    console.log(`[PASS] Web workspace loaded: HTTP ${webResult.status} (${webResult.elapsedMs}ms), 0 console errors, 0 bad responses`);
   } finally {
     await browser.close();
   }
 
-  console.log("=== All Phase 1 smoke checks PASSED ===");
+  console.log("=== All stack smoke checks PASSED ===");
 }
 
 main().catch((err) => {
-  console.error("[FAIL] Phase 1 smoke test failed:", err);
+  console.error("[FAIL] Stack smoke test failed:", err);
   process.exit(1);
 });

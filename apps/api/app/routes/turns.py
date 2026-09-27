@@ -8,7 +8,7 @@ import logging
 from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..domain.models import Turn
 from ..harness.coordinator import HarnessCoordinator
@@ -30,18 +30,78 @@ class RespondPermissionRequest(BaseModel):
     decision: PermissionDecision
 
 
+class PendingPermissionView(BaseModel):
+    request_id: str
+    title: str
+    created_at: float
+
+
+class LoopView(BaseModel):
+    current_iteration: int
+    max_iterations: int | None
+    stop_requested: bool
+
+
+class ActivityView(BaseModel):
+    event_id: str
+    event_type: str
+    created_at: str
+    payload: dict[str, str]
+
+
+class TurnDetailResponse(Turn):
+    pending_permissions: list[PendingPermissionView] = Field(default_factory=list)
+    loop: LoopView | None = None
+    events: list[ActivityView] = Field(default_factory=list)
+
+
 # --- Endpoints ---
 
-@router.get("/turns/{turn_id}", response_model=Turn)
+@router.get("/turns/{turn_id}", response_model=TurnDetailResponse)
 async def get_turn(
     turn_id: str,
     store: BaseStore = Depends(get_store),
-) -> Turn:
+    coordinator: HarnessCoordinator = Depends(get_coordinator),
+) -> TurnDetailResponse:
     """Retrieve runtime facts and state for a Turn (§8)."""
     turn = store.get_turn(turn_id)
     if not turn:
         raise HTTPException(status_code=404, detail=f"Turn '{turn_id}' not found")
-    return turn
+    detail = TurnDetailResponse(**turn.model_dump())
+    if coordinator.has_adapter(turn.bound_agent_id):
+        adapter = coordinator.get_adapter(turn.bound_agent_id)
+        if turn.native_session_ref and hasattr(adapter, "list_pending_permissions"):
+            detail.pending_permissions = [
+                PendingPermissionView(
+                    request_id=str(p.request_id),
+                    title=str(p.tool_call.get("title") or p.tool_call.get("toolName") or p.tool_call.get("name") or "Agent permission request"),
+                    created_at=p.created_at,
+                )
+                for p in adapter.list_pending_permissions(session_id=turn.native_session_ref)
+                if p.turn_id == turn_id
+            ]
+        runtime = getattr(adapter, "runtime", None)
+        if runtime and runtime.is_loop_active(turn_id):
+            # Read the existing runtime fact; this DTO owns no execution state.
+            loop = runtime._active_loops[turn_id]
+            detail.loop = LoopView(
+                current_iteration=loop["current_iteration"],
+                max_iterations=loop["max_iterations"],
+                stop_requested=bool(loop.get("stopped")),
+            )
+    for event in store.list_events(turn_id):
+        if event.event_type in ("raw", "delta"):
+            continue
+        # Never expose thought text or arbitrary tool arguments in the inspector.
+        keys = ("status",) if event.event_type == "thinking" else ("status", "tool", "boundary")
+        detail.events.append(ActivityView(
+            event_id=event.event_id,
+            event_type=event.event_type,
+            created_at=event.created_at,
+            payload={key: event.payload[key] for key in keys if isinstance(event.payload.get(key), str)},
+        ))
+    detail.events = detail.events[-40:]
+    return detail
 
 
 @router.post("/turns/{turn_id}/cancel", response_model=Turn)

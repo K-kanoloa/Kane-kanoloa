@@ -21,6 +21,7 @@
         "stop:stack": "powershell -ExecutionPolicy Bypass -File scripts/stop-stack.ps1",
         "wait:stack": "powershell -ExecutionPolicy Bypass -File scripts/wait-for-stack.ps1",
         "test:e2e:smoke": "node scripts/e2e-smoke.mjs",
+        "test:e2e:ui": "node scripts/e2e-ui.mjs",
         "dev:api": "node scripts/run-python.mjs apps/api -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000",
         "dev:bridge": "node scripts/run-python.mjs apps/local-bridge -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8010",
         "dev:web": "npm --workspace @kane/web run dev",

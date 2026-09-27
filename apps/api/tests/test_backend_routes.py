@@ -10,6 +10,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.adapters.mock_adapter import MockAdapter
 from app.adapters.kanaloa_adapter import KanaloaAdapter
+from app.adapters.kanaloa_adapter import PendingPermissionRequest
 from app.domain.models import AgentCapabilities, Conversation, Message, Turn
 from app.harness.coordinator import HarnessCoordinator
 from app.harness.dispatcher import Dispatcher
@@ -281,6 +282,33 @@ async def test_loop_rejection_does_not_create_turn(app_env):
         )
         assert response.status_code == 400
         assert store.list_turns(conv["conversation_id"]) == []
+
+
+@pytest.mark.asyncio
+async def test_turn_detail_projects_only_bound_permissions_and_safe_activity(app_env):
+    app, store, coord, _, _ = app_env
+    adapter = KanaloaAdapter(event_handler=coord)
+    coord.register_adapter("kanaloa", adapter)
+    conv = Conversation()
+    store.save_conversation(conv)
+    turn = Turn(conversation_id=conv.conversation_id, bound_agent_id="kanaloa", native_session_ref="session_a")
+    store.save_turn(turn)
+    for key, session, tid in [("own", "session_a", turn.turn_id), ("other", "session_b", "other_turn"), ("same_session", "session_a", "other_turn")]:
+        adapter._pending_permissions[key] = PendingPermissionRequest(request_id=key, session_id=session, turn_id=tid, tool_call={"title": "Read project files", "secret_argument": "hidden"}, options=[], created_at=1.0)
+    adapter.runtime._active_loops[turn.turn_id] = {"current_iteration": 2, "max_iterations": None, "stopped": True}
+    await coord.emit_event(turn.turn_id, "thinking", {"status": "thinking", "summary": "PRIVATE_THOUGHT"})
+    await coord.emit_event(turn.turn_id, "tool_start", {"tool": "read_file", "arguments": "PRIVATE_ARGUMENTS"})
+    await coord.emit_event(turn.turn_id, "raw", {"raw": "PRIVATE_RAW"})
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/api/v1/turns/{turn.turn_id}")
+        assert response.status_code == 200
+        result = response.json()
+        assert result["pending_permissions"] == [{"request_id": "own", "title": "Read project files", "created_at": 1.0}]
+        assert result["loop"] == {"current_iteration": 2, "max_iterations": None, "stop_requested": True}
+        assert [e["event_type"] for e in result["events"]] == ["thinking", "tool_start"]
+        assert "PRIVATE" not in response.text and "secret_argument" not in response.text
+        assert store.get_turn(turn.turn_id).status == "running"
+        assert len(adapter._pending_permissions) == 3
 
 
 @pytest.mark.asyncio
