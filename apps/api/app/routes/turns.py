@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -23,8 +23,11 @@ router = APIRouter(tags=["turns"])
 
 # --- Request DTOs ---
 
+PermissionDecision = Literal["allow-once", "reject-once", "cancelled"]
+
+
 class RespondPermissionRequest(BaseModel):
-    decision: str
+    decision: PermissionDecision
 
 
 # --- Endpoints ---

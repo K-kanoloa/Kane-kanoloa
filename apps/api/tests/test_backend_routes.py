@@ -286,13 +286,30 @@ async def test_approval_respond_permission_endpoint(app_env):
         )
         assert res.status_code == 400
 
-        # 3. Invalid decision value -> 400
+        # 3. Invalid decision value -> 422 (FastAPI request validation error from PermissionDecision enum)
         await adapter.simulate_permission_request(turn_id="t_appr", request_id="perm_102", tool_name="fs_write", session_id="sess_appr")
         res = await client.post(
             "/api/v1/turns/t_appr/permissions/perm_102/respond",
             json={"decision": "invalid-option"},
         )
-        assert res.status_code == 400
+        assert res.status_code == 422
+
+        # 4. Valid reject-once -> 200
+        res = await client.post(
+            "/api/v1/turns/t_appr/permissions/perm_102/respond",
+            json={"decision": "reject-once"},
+        )
+        assert res.status_code == 200
+        assert res.json()["decision"] == "reject-once"
+
+        # 5. Valid cancelled -> 200
+        await adapter.simulate_permission_request(turn_id="t_appr", request_id="perm_103", tool_name="fs_write", session_id="sess_appr")
+        res = await client.post(
+            "/api/v1/turns/t_appr/permissions/perm_103/respond",
+            json={"decision": "cancelled"},
+        )
+        assert res.status_code == 200
+        assert res.json()["decision"] == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -358,3 +375,136 @@ async def test_error_mapping_discipline(app_env):
         assert res.status_code == 404
         res = await client.post("/api/v1/turns/ghost_turn/permissions/req1/respond", json={"decision": "allow-once"})
         assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_messages_endpoint_branch_visible_history(app_env):
+    """§16, §17: GET /conversations/{id}/messages?turn_id returns branch-visible history via get_turn_history."""
+    app, store, coord, disp, adapter = app_env
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # 1. Create conversation
+        res = await client.post("/api/v1/conversations", json={"title": "Branch History Test"})
+        assert res.status_code == 200
+        conv_id = res.json()["conversation_id"]
+
+        # 2. Main branch messages: M1 and M2
+        res_m1 = await client.post(f"/api/v1/conversations/{conv_id}/messages", json={"content": "M1"})
+        assert res_m1.status_code == 200
+        m1_id = res_m1.json()["message"]["message_id"]
+        main_turn_id = res_m1.json()["turn"]["turn_id"]
+
+        res_m2 = await client.post(
+            f"/api/v1/conversations/{conv_id}/messages",
+            json={"content": "M2", "turn_id": main_turn_id},
+        )
+        assert res_m2.status_code == 200
+        m2_id = res_m2.json()["message"]["message_id"]
+
+        # 3. Create branch from M2 (forking off M2)
+        res_branch = await client.post(
+            f"/api/v1/conversations/{conv_id}/branches",
+            json={"message_id": m2_id, "title": "Side Branch"},
+        )
+        assert res_branch.status_code == 200
+        branch_turn_id = res_branch.json()["initial_turn_id"]
+
+        # 4. Send M3 on branch turn
+        res_m3 = await client.post(
+            f"/api/v1/conversations/{conv_id}/messages",
+            json={"content": "M3_branch", "turn_id": branch_turn_id},
+        )
+        assert res_m3.status_code == 200
+
+        # 5. Send M4 on main turn (after branching)
+        res_m4 = await client.post(
+            f"/api/v1/conversations/{conv_id}/messages",
+            json={"content": "M4_main", "turn_id": main_turn_id},
+        )
+        assert res_m4.status_code == 200
+
+        # 6. Query branch turn visible history: must see M1, M2, M3; must NOT see M4!
+        res_branch_hist = await client.get(
+            f"/api/v1/conversations/{conv_id}/messages",
+            params={"turn_id": branch_turn_id},
+        )
+        assert res_branch_hist.status_code == 200
+        branch_msgs = res_branch_hist.json()
+        assert [m["content"] for m in branch_msgs] == ["M1", "M2", "M3_branch"]
+
+        # 7. Query main turn visible history: must see M1, M2, M4; must NOT see M3!
+        res_main_hist = await client.get(
+            f"/api/v1/conversations/{conv_id}/messages",
+            params={"turn_id": main_turn_id},
+        )
+        assert res_main_hist.status_code == 200
+        main_msgs = res_main_hist.json()
+        assert [m["content"] for m in main_msgs] == ["M1", "M2", "M4_main"]
+
+        # 8. Query without turn_id returns all conversation messages
+        res_all = await client.get(f"/api/v1/conversations/{conv_id}/messages")
+        assert res_all.status_code == 200
+        assert len(res_all.json()) == 4
+
+        # 9. Error cases: missing turn -> 404
+        res_404 = await client.get(
+            f"/api/v1/conversations/{conv_id}/messages",
+            params={"turn_id": "non_existent_turn"},
+        )
+        assert res_404.status_code == 404
+
+        # 10. Turn from another conversation -> 400
+        res_other = await client.post("/api/v1/conversations", json={"title": "Other Conv"})
+        other_conv_id = res_other.json()["conversation_id"]
+        res_400 = await client.get(
+            f"/api/v1/conversations/{other_conv_id}/messages",
+            params={"turn_id": branch_turn_id},
+        )
+        assert res_400.status_code == 400
+        assert "does not belong" in res_400.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_auth_inheritance(monkeypatch, app_env):
+    """Confirm /api/v1 inherits existing ApiAuthMiddleware without adding duplicate auth layers."""
+    app, store, coord, disp, adapter = app_env
+
+    # 1. No token configured -> requests pass freely
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.get("/api/v1/conversations")
+        assert res.status_code == 200
+        res = await client.get("/health")
+        assert res.status_code == 200
+
+    # 2. Token configured -> /api/v1 enforces auth, /health is exempt
+    monkeypatch.setenv("OCTOPUS_API_TOKEN", "secure-token-xyz")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # Exempt route passes without token
+        res_health = await client.get("/health")
+        assert res_health.status_code == 200
+
+        # /api/v1 without token -> 401
+        res_unauth = await client.get("/api/v1/conversations")
+        assert res_unauth.status_code == 401
+        assert res_unauth.json() == {"detail": "api_auth_required"}
+
+        # /api/v1 with invalid token -> 401
+        res_bad = await client.get(
+            "/api/v1/conversations",
+            headers={"X-Api-Key": "wrong-token"},
+        )
+        assert res_bad.status_code == 401
+
+        # /api/v1 with valid X-Api-Key -> 200
+        res_apikey = await client.get(
+            "/api/v1/conversations",
+            headers={"X-Api-Key": "secure-token-xyz"},
+        )
+        assert res_apikey.status_code == 200
+
+        # /api/v1 with valid Bearer token -> 200
+        res_bearer = await client.get(
+            "/api/v1/conversations",
+            headers={"Authorization": "Bearer secure-token-xyz"},
+        )
+        assert res_bearer.status_code == 200

@@ -94,8 +94,9 @@ async def get_conversation(
 @router.get("/conversations/{conversation_id}/messages", response_model=list[Message])
 async def get_conversation_messages(
     conversation_id: str,
-    turn_id: str | None = Query(None, description="Optional filter by turn_id"),
+    turn_id: str | None = Query(None, description="Optional filter by turn_id for branch-visible history"),
     store: BaseStore = Depends(get_store),
+    dispatcher: Dispatcher = Depends(get_dispatcher),
 ) -> list[Message]:
     """Retrieve chat message history for a conversation (§5)."""
     conv = store.get_conversation(conversation_id)
@@ -103,10 +104,17 @@ async def get_conversation_messages(
         raise HTTPException(
             status_code=404, detail=f"Conversation '{conversation_id}' not found"
         )
-    messages = store.get_messages(conversation_id)
     if turn_id:
-        messages = [m for m in messages if m.turn_id == turn_id]
-    return messages
+        turn = store.get_turn(turn_id)
+        if not turn:
+            raise HTTPException(status_code=404, detail=f"Turn '{turn_id}' not found")
+        if turn.conversation_id != conversation_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Turn '{turn_id}' does not belong to conversation '{conversation_id}'",
+            )
+        return dispatcher.get_turn_history(turn)
+    return store.get_messages(conversation_id)
 
 
 @router.post("/conversations/{conversation_id}/messages", response_model=SendMessageResponse)
