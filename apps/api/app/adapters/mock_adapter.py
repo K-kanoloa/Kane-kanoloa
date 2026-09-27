@@ -34,7 +34,10 @@ class MockAdapter(BaseAdapter):
         self.steer_calls: list[dict[str, Any]] = []
         self.cancel_calls: list[dict[str, Any]] = []
         self.resume_calls: list[dict[str, Any]] = []
+        self.stop_loop_calls: list[dict[str, Any]] = []
         self.live_sessions: set[str] = set()
+        self.pending_permissions: dict[str, dict[str, Any]] = {}
+        self.permission_responses: list[dict[str, Any]] = []
 
         # Hook for custom execution simulation
         self.on_send_behavior: Any = None
@@ -130,3 +133,51 @@ class MockAdapter(BaseAdapter):
         if not native_session_ref:
             return False
         return native_session_ref in self.live_sessions
+
+    def stop_loop(self, turn: Turn) -> None:
+        self.stop_loop_calls.append({"turn": turn})
+
+    async def simulate_permission_request(
+        self,
+        turn_id: str,
+        request_id: str | int,
+        tool_name: str,
+        session_id: str | None = None,
+    ) -> None:
+        """Simulate agent requesting permission (waiting_user)."""
+        self.pending_permissions[str(request_id)] = {
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "tool_name": tool_name,
+            "session_id": session_id,
+        }
+        await self.event_handler.emit_waiting_user(
+            turn_id, prompt=f"Permission required for {tool_name} (request_id: {request_id})"
+        )
+
+    async def respond_permission(
+        self,
+        request_id: str | int,
+        decision: str,
+        session_id: str | None = None,
+    ) -> None:
+        """Respond to simulated permission request."""
+        perm_key = str(request_id)
+        if perm_key not in self.pending_permissions:
+            raise ValueError(f"Unknown permission request '{request_id}'")
+        perm = self.pending_permissions.pop(perm_key)
+        if session_id and perm.get("session_id") and perm["session_id"] != session_id:
+            raise ValueError(
+                f"Session mismatch for permission request '{request_id}': "
+                f"expected '{perm['session_id']}', got '{session_id}'"
+            )
+        if decision not in ("allow-once", "reject-once", "cancelled"):
+            raise ValueError(f"Invalid permission decision '{decision}'")
+        self.permission_responses.append({
+            "request_id": request_id,
+            "decision": decision,
+            "session_id": session_id,
+        })
+        await self.event_handler.emit_resumed(
+            perm["turn_id"], reason=f"permission_response:{request_id}:{decision}"
+        )

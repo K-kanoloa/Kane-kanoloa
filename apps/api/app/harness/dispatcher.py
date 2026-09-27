@@ -471,3 +471,14 @@ class Dispatcher:
         history = self.get_turn_history(turn)
         await adapter.resume(turn, history)
         return self.store.get_turn(turn_id)
+
+    def stop_loop(self, turn_id: str) -> Turn:
+        """Gracefully stop loop execution for an active loop Turn (§11)."""
+        turn = self.store.get_turn(turn_id)
+        if not turn:
+            raise ValueError(f"Turn '{turn_id}' not found")
+
+        adapter = self.coordinator.get_adapter(turn.bound_agent_id)
+        if hasattr(adapter, "stop_loop"):
+            adapter.stop_loop(turn)
+        return turn

@@ -28,9 +28,19 @@ class SQLiteStore(BaseStore):
     def __init__(self, db_path: str | Path = ":memory:"):
         self.db_path = str(db_path)
         self._local = threading.local()
+        self._memory_conn: sqlite3.Connection | None = None
+        if self.db_path == ":memory:":
+            self._memory_conn = sqlite3.connect(
+                ":memory:",
+                check_same_thread=False,
+                timeout=30.0,
+            )
+            self._memory_conn.row_factory = sqlite3.Row
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
+        if self._memory_conn is not None:
+            return self._memory_conn
         if not hasattr(self._local, "conn") or self._local.conn is None:
             conn = sqlite3.connect(
                 self.db_path,
@@ -44,7 +54,10 @@ class SQLiteStore(BaseStore):
         return self._local.conn
 
     def close(self) -> None:
-        """Close thread-local database connection."""
+        """Close database connection."""
+        if self._memory_conn is not None:
+            self._memory_conn.close()
+            self._memory_conn = None
         if hasattr(self._local, "conn") and self._local.conn is not None:
             self._local.conn.close()
             self._local.conn = None
