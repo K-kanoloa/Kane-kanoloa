@@ -613,7 +613,7 @@ async def test_loop_mode_stop_does_not_start_next_iteration(harness_env):
 async def test_loop_mode_failed_halts_loop_immediately(harness_env):
     """
     Verify failed condition (Section 8.B):
-    - Iteration 1 encounters error (e.g. ACP prompt error).
+    - Iteration 1 receives an explicit Agent work-failed completion.
     - Loop terminates immediately without starting next iteration.
     - Turn transitions to 'failed'.
     """
@@ -621,7 +621,7 @@ async def test_loop_mode_failed_halts_loop_immediately(harness_env):
 
     kanaloa = LoopMockWireKanaloaAdapter(
         prompt_responses=[
-            {"error": {"code": -32603, "message": "DSH runtime fatal execution error"}},
+            {"result": {"stopReason": "failed", "failureReason": "Agent work failed"}},
             {"result": {"stopReason": "endTurn"}},  # iteration 2 must NOT run
         ],
         event_handler=coord,
@@ -639,6 +639,46 @@ async def test_loop_mode_failed_halts_loop_immediately(harness_env):
     assert kanaloa._prompt_call_count == 1
     # Turn marked as failed
     assert store.get_turn("t_lfail").status == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loop_mode", [False, True])
+async def test_stdio_failure_is_interrupted_not_failed(harness_env, loop_mode):
+    store, _, coord, _ = harness_env
+
+    async def broken_prompt(_params):
+        raise BrokenPipeError("stdio disconnected")
+
+    adapter = LoopMockWireKanaloaAdapter(prompt_responses=[broken_prompt], event_handler=coord)
+    conv = Conversation(conversation_id="c_stdio", bound_agent_id="kanaloa")
+    turn = Turn(turn_id="t_stdio", conversation_id=conv.conversation_id,
+                bound_agent_id="kanaloa", partial_output="Partial answer")
+    store.save_conversation(conv)
+    store.save_turn(turn)
+    message = Message(conversation_id=conv.conversation_id, sender="user", content="Work")
+    if loop_mode:
+        await adapter.send(turn, message, [], max_iterations=5)
+    else:
+        await adapter.send(turn, message, [])
+    await asyncio.sleep(0.05)
+    persisted = store.get_turn(turn.turn_id)
+    assert persisted.status == "interrupted"
+    assert persisted.partial_output == "Partial answer"
+    assert "stdio disconnected" in persisted.interrupt_reason
+
+
+@pytest.mark.asyncio
+async def test_process_disconnect_interrupts_active_turn_without_approval(harness_env):
+    store, _, coord, _ = harness_env
+    adapter = LoopMockWireKanaloaAdapter(event_handler=coord)
+    conv = Conversation(conversation_id="c_exit", bound_agent_id="kanaloa")
+    turn = Turn(turn_id="t_exit", conversation_id=conv.conversation_id,
+                bound_agent_id="kanaloa", native_session_ref="session_exit")
+    store.save_conversation(conv)
+    store.save_turn(turn)
+    adapter.bind_session(turn.turn_id, "session_exit")
+    await adapter._handle_disconnect(reason="acp_process_disconnected")
+    assert store.get_turn(turn.turn_id).status == "interrupted"
 
 
 @pytest.mark.asyncio
@@ -787,4 +827,3 @@ async def test_loop_mode_steer_does_not_increment_iteration(harness_env):
     assert kanaloa._prompt_call_count == 2
     assert len(kanaloa.steer_requests) == 1
     assert store.get_turn("t_lsteer_cnt").status == "finished"
-

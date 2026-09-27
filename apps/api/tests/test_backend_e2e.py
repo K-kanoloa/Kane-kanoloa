@@ -18,6 +18,7 @@ from app.store.sqlite_store import SQLiteStore
 
 class SessionMockAdapter(MockAdapter):
     def __init__(self, **kwargs):
+        kwargs.setdefault("capabilities", AgentCapabilities(steer_mode="native", branch_mode="replay"))
         super().__init__(**kwargs)
         self._turn_sessions: dict[str, str] = {}
 

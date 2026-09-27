@@ -311,12 +311,17 @@ class KanaloaRuntime:
 
                 if "error" in resp:
                     err_msg = resp["error"].get("message", "ACP prompt error in loop")
-                    await event_handler.emit_failed(turn_id, reason=str(err_msg))
+                    await event_handler.emit_interrupted(turn_id, reason=f"acp_protocol:{err_msg}")
                     return
 
                 # Check if cancelled mid-flight
                 if stop_reason == "cancelled" or loop_meta.get("cancelled"):
                     await event_handler.emit_interrupted(turn_id, reason="cancelled_by_acp")
+                    return
+                if stop_reason == "failed":
+                    await event_handler.emit_failed(
+                        turn_id, reason=str(resp.get("result", {}).get("failureReason") or "agent_reported_failure")
+                    )
                     return
 
                 # Check if turn was externally marked inactive during iteration execution
@@ -368,7 +373,8 @@ class KanaloaRuntime:
             )
         except Exception as e:
             logger.error("KanaloaRuntime: loop execution exception: %s", e)
-            await event_handler.emit_failed(turn_id, reason=str(e))
+            if not hasattr(event_handler, "is_turn_active") or event_handler.is_turn_active(turn_id):
+                await event_handler.emit_interrupted(turn_id, reason=f"acp_transport:{e}")
         finally:
             self._active_loops.pop(turn_id, None)
             self._iteration_outputs.pop(turn_id, None)

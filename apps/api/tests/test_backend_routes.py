@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.adapters.mock_adapter import MockAdapter
+from app.adapters.kanaloa_adapter import KanaloaAdapter
 from app.domain.models import AgentCapabilities, Conversation, Message, Turn
 from app.harness.coordinator import HarnessCoordinator
 from app.harness.dispatcher import Dispatcher
@@ -29,6 +31,27 @@ class SessionMockAdapter(MockAdapter):
         self._turn_sessions[turn.turn_id] = sess_id
         turn.native_session_ref = sess_id
         await super().send(turn, message, history)
+
+
+class LoopHttpAdapter(KanaloaAdapter):
+    def __init__(self, complete_first: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.prompt_count = 0
+        self.complete_first = complete_first
+
+    async def _ensure_process(self) -> None:
+        self._is_initialized = True
+
+    async def _send_request(self, method: str, params: dict | None = None) -> dict:
+        if method == "session/new":
+            return {"result": {"sessionId": "http_loop_session"}}
+        if method == "session/prompt":
+            self.prompt_count += 1
+            if self.complete_first:
+                await self.event_handler.emit_delta(self._session_turns["http_loop_session"], "[COMPLETE]")
+                self.runtime.record_delta(self._session_turns["http_loop_session"], "[COMPLETE]")
+            return {"result": {"stopReason": "endTurn"}}
+        return {"result": {}}
 
 
 @pytest.fixture
@@ -208,6 +231,56 @@ async def test_branch_creation_api(app_env):
             json={"message_id": "invalid_msg_id"},
         )
         assert res.status_code == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit, expected", [(5, 5), (3, 3), (None, 1)])
+async def test_http_loop_mode_reaches_existing_runtime(app_env, limit, expected):
+    app, store, coord, disp, _ = app_env
+    adapter = LoopHttpAdapter(complete_first=limit is None, event_handler=coord)
+    coord.register_adapter("kanaloa", adapter)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        conv = (await client.post("/api/v1/conversations", json={})).json()
+        body = {"content": "Run loop", "loop_mode": True}
+        if limit != 5:
+            body["max_iterations"] = limit
+        response = await client.post(f"/api/v1/conversations/{conv['conversation_id']}/messages", json=body)
+        assert response.status_code == 200
+        turn_id = response.json()["turn"]["turn_id"]
+        await asyncio.sleep(0.05)
+        assert adapter.prompt_count == expected
+        assert store.get_turn(turn_id).status == "finished"
+
+
+@pytest.mark.asyncio
+async def test_branch_rejects_unsupported_adapter(app_env):
+    app, store, coord, _, adapter = app_env
+    adapter.set_capabilities(AgentCapabilities(branch_mode="unsupported"))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        conv = (await client.post("/api/v1/conversations", json={})).json()
+        message = (await client.post(
+            f"/api/v1/conversations/{conv['conversation_id']}/messages", json={"content": "First"}
+        )).json()["message"]
+        response = await client.post(
+            f"/api/v1/conversations/{conv['conversation_id']}/branches",
+            json={"message_id": message["message_id"]},
+        )
+        assert response.status_code == 400
+        assert store.list_branches(conv["conversation_id"]) == []
+
+
+@pytest.mark.asyncio
+async def test_loop_rejection_does_not_create_turn(app_env):
+    app, store, coord, _, adapter = app_env
+    coord.register_adapter("other", adapter)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        conv = (await client.post("/api/v1/conversations", json={"bound_agent_id": "other"})).json()
+        response = await client.post(
+            f"/api/v1/conversations/{conv['conversation_id']}/messages",
+            json={"content": "No loop", "loop_mode": True},
+        )
+        assert response.status_code == 400
+        assert store.list_turns(conv["conversation_id"]) == []
 
 
 @pytest.mark.asyncio

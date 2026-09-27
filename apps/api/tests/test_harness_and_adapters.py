@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
+from pathlib import Path
 from typing import Any
 import pytest
 
@@ -345,6 +347,12 @@ async def test_steer_degradation_modes(harness_env):
     assert len(mock_safe.steer_calls) == 1
     assert mock_safe.steer_calls[0]["message"].content == "Safe boundary steer"
 
+    # Completion must not silently consume a queued safe-boundary steer.
+    await dispatcher.dispatch_user_message("c_safe", "Steer before completion")
+    await coord.emit_message_complete("t_safe", content="Done")
+    assert mbx_safe.pending_count == 1
+    assert store.list_unsettled_inbound()[0][2:] == ("steer", "pending")
+
     # --- Mode 3: Follow Up Only ---
     mock_followup = MockAdapter(
         capabilities=AgentCapabilities(steer_mode="follow_up_only")
@@ -399,13 +407,76 @@ async def test_steer_degradation_modes(harness_env):
     mbx_fail = mbx_mgr.get_mailbox("t_followup_fail")
     assert mbx_fail.pending_count == 1
 
-    # Turn fails
+    # Turn fails; queued follow-up stays pending for explicit continuation.
     await coord.emit_failed("t_followup_fail", reason="Engine error")
     await asyncio.sleep(0.01)
-
-    # Must NOT auto-dispatch; preserved in mailbox waiting for explicit user resumption
     assert mbx_fail.pending_count == 1
 
+
+@pytest.mark.asyncio
+async def test_queued_inbound_survives_store_restart():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "kane.db"
+        store = SQLiteStore(db_path)
+        mailboxes = MailboxManager()
+        coordinator = HarnessCoordinator(store, mailboxes)
+        dispatcher = Dispatcher(store, coordinator, mailboxes)
+        coordinator.register_adapter("agent_safe", MockAdapter(
+            capabilities=AgentCapabilities(steer_mode="safe_boundary")
+        ))
+        conv = Conversation(conversation_id="c_delivery", bound_agent_id="agent_safe", focus_turn_id="t_delivery")
+        turn = Turn(turn_id="t_delivery", conversation_id=conv.conversation_id,
+                    bound_agent_id="agent_safe", native_session_ref="native_live")
+        store.save_conversation(conv)
+        store.save_turn(turn)
+        message, _ = await dispatcher.dispatch_user_message(conv.conversation_id, "Apply at next boundary")
+        assert store.list_unsettled_inbound() == [(message.message_id, turn.turn_id, "steer", "pending")]
+        store.close()
+
+        reopened = SQLiteStore(db_path)
+        recovered_mailboxes = MailboxManager()
+        recovered = HarnessCoordinator(reopened, recovered_mailboxes)
+        Dispatcher(reopened, recovered, recovered_mailboxes)
+        adapter = MockAdapter(capabilities=AgentCapabilities(steer_mode="safe_boundary"))
+        adapter.live_sessions.add("native_live")
+        recovered.register_adapter("agent_safe", adapter)
+        await recovered.reconcile_startup_turns()
+        assert recovered_mailboxes.get_mailbox(turn.turn_id).pending_count == 1
+        await recovered.emit_boundary_signal(turn.turn_id)
+        assert [call["message"].message_id for call in adapter.steer_calls] == [message.message_id]
+        assert reopened.list_unsettled_inbound() == []
+        assert len(reopened.get_messages(conv.conversation_id)) == 1
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_uncertain_inbound_is_not_replayed_after_restart():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "kane.db"
+        store = SQLiteStore(db_path)
+        conv = Conversation(conversation_id="c_uncertain", bound_agent_id="agent_safe")
+        turn = Turn(turn_id="t_uncertain", conversation_id=conv.conversation_id,
+                    bound_agent_id="agent_safe", native_session_ref="native_live")
+        store.save_conversation(conv)
+        store.save_turn(turn)
+        message = Message(conversation_id=conv.conversation_id, turn_id=turn.turn_id,
+                          sender="user", content="Possibly delivered")
+        store.append_message(message, delivery_kind="steer")
+        assert store.claim_inbound(message.message_id)
+        store.close()
+
+        reopened = SQLiteStore(db_path)
+        mailboxes = MailboxManager()
+        coordinator = HarnessCoordinator(reopened, mailboxes)
+        adapter = MockAdapter(capabilities=AgentCapabilities(steer_mode="safe_boundary"))
+        adapter.live_sessions.add("native_live")
+        coordinator.register_adapter("agent_safe", adapter)
+        await coordinator.reconcile_startup_turns()
+        assert reopened.get_turn(turn.turn_id).status == "interrupted"
+        assert reopened.get_turn(turn.turn_id).interrupt_reason == "delivery_outcome_unknown_on_restart"
+        assert mailboxes.get_mailbox(turn.turn_id).is_empty
+        assert adapter.steer_calls == []
+        reopened.close()
 
 @pytest.mark.asyncio
 async def test_completion_deterministic_precedence(harness_env):
@@ -1555,7 +1626,4 @@ async def test_approval_resumes_via_emit_resumed_without_adapter_store_access(ha
 
     # Adapter itself must have NO store reference
     assert not hasattr(kanaloa, "store")
-
-
-
 

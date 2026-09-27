@@ -17,7 +17,7 @@ from typing import Any, Callable
 from ..adapters.base import AgentEventHandler, BaseAdapter
 from ..domain.models import EventType, Message, Turn, TurnEvent, current_iso
 from ..store.base import BaseStore
-from .mailbox import MailboxManager
+from .mailbox import MailboxItem, MailboxManager
 
 
 class HarnessCoordinator(AgentEventHandler):
@@ -179,8 +179,9 @@ class HarnessCoordinator(AgentEventHandler):
 
         # Check mailbox for pending follow-up items (e.g. from follow_up_only steer mode)
         mailbox = self.mailbox_manager.get_mailbox(turn_id)
-        next_item = mailbox.get_nowait()
-        if next_item and next_item.item_type == "message":
+        pending = mailbox.peek_pending()
+        if pending and pending[0].item_type == "message":
+            next_item = mailbox.get_nowait()
             msg_payload = next_item.payload
             followup_msg_id = msg_payload.get("message_id")
             if followup_msg_id:
@@ -315,15 +316,16 @@ class HarnessCoordinator(AgentEventHandler):
 
             msg_id = steer_item.payload.get("message_id")
             steer_msg = self.store.get_message(msg_id) if msg_id else None
-            if not steer_msg:
-                steer_msg = Message(
-                    conversation_id=turn.conversation_id,
-                    sender="user",
-                    content=steer_item.payload.get("content", ""),
-                )
+            if not steer_msg or not self.store.claim_inbound(steer_msg.message_id):
+                return
 
             adapter = self.get_adapter(turn.bound_agent_id)
-            await adapter.steer(turn, steer_msg)
+            try:
+                await adapter.steer(turn, steer_msg)
+            except Exception as exc:
+                await self.emit_interrupted(turn_id, reason=f"delivery_outcome_unknown:{exc}")
+                return
+            self.store.complete_inbound(steer_msg.message_id)
 
             boundary_event = TurnEvent(
                 turn_id=turn_id,
@@ -373,4 +375,26 @@ class HarnessCoordinator(AgentEventHandler):
             else:
                 await self.emit_interrupted(turn.turn_id, reason="unrecoverable:session_lost_on_startup")
                 results[turn.turn_id] = "interrupted"
+
+        for message_id, turn_id, kind, state in self.store.list_unsettled_inbound():
+            turn = self.store.get_turn(turn_id)
+            message = self.store.get_message(message_id)
+            if not turn or not message:
+                continue
+            if state == "dispatching":
+                if turn.status in ("running", "waiting_user"):
+                    await self.emit_interrupted(turn_id, reason="delivery_outcome_unknown_on_restart")
+                    results[turn_id] = "interrupted"
+                continue
+            if kind == "message" and turn.status == "finished" and self._followup_handler:
+                await self._followup_handler(turn, message)
+                results[turn_id] = self.store.get_turn(turn_id).status
+                continue
+            mailbox = self.mailbox_manager.get_mailbox(turn_id)
+            if not any(item.payload.get("message_id") == message_id for item in mailbox.peek_pending()):
+                mailbox.put_nowait(MailboxItem(
+                    turn_id=turn_id,
+                    item_type=kind,
+                    payload={"message_id": message_id, "content": message.content},
+                ))
         return results

@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
-from app.main import app
+from app.main import app, create_app
 from app.security.url_safety import is_safe_http_url
 from app.store.sqlite_store import SQLiteStore
 
@@ -13,6 +13,15 @@ from app.store.sqlite_store import SQLiteStore
 def test_api_imports_and_creates_app():
     assert app.title == "Kane Agent Platform API"
     assert app.version == "2.0.0"
+
+
+def test_default_lifespan_starts_without_adapter_injection():
+    fresh_app = create_app()
+    fresh_app.state.store = SQLiteStore(":memory:")
+    with TestClient(fresh_app) as client:
+        assert client.get("/health").status_code == 200
+        assert fresh_app.state.coordinator.has_adapter("kanaloa")
+        assert fresh_app.state.kanaloa_adapter.runtime is fresh_app.state.kanaloa_runtime
 
 
 def test_health_endpoint_responds_honestly():

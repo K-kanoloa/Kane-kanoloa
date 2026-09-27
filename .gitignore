@@ -38,6 +38,9 @@ apps/data.v2-final-*/
 
 # Legacy/alternate API data path (if used)
 apps/api/data/
+apps/api/kane.db
+apps/api/kane.db-wal
+apps/api/kane.db-shm
 
 # E2E / script evidence logs (regenerable)
 reports/*.log

@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
+from typing import Literal
 
 from .base import BaseStore
 from ..domain.models import (
@@ -121,6 +122,16 @@ class SQLiteStore(BaseStore):
                 """
                 CREATE INDEX IF NOT EXISTS idx_messages_turn_id
                 ON messages (turn_id);
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS inbound_delivery (
+                    message_id TEXT PRIMARY KEY,
+                    turn_id TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('message', 'steer')),
+                    state TEXT NOT NULL CHECK (state IN ('pending', 'dispatching'))
+                );
                 """
             )
             conn.execute(
@@ -292,7 +303,11 @@ class SQLiteStore(BaseStore):
         return [Conversation(**dict(r)) for r in rows]
 
     # --- Message Operations (Append-Only) ---
-    def append_message(self, message: Message) -> None:
+    def append_message(
+        self,
+        message: Message,
+        delivery_kind: Literal["message", "steer"] | None = None,
+    ) -> None:
         conn = self._get_connection()
         with conn:
             conn.execute(
@@ -315,6 +330,37 @@ class SQLiteStore(BaseStore):
                     message.target_message_id,
                     message.created_at,
                 ),
+            )
+            if delivery_kind is not None:
+                if message.sender != "user" or not message.turn_id:
+                    raise ValueError("Queued delivery requires a user message bound to a Turn")
+                conn.execute(
+                    "INSERT INTO inbound_delivery (message_id, turn_id, kind, state) VALUES (?, ?, ?, 'pending')",
+                    (message.message_id, message.turn_id, delivery_kind),
+                )
+
+    def list_unsettled_inbound(self) -> list[tuple[str, str, str, str]]:
+        rows = self._get_connection().execute(
+            "SELECT message_id, turn_id, kind, state FROM inbound_delivery ORDER BY rowid"
+        ).fetchall()
+        return [(r["message_id"], r["turn_id"], r["kind"], r["state"]) for r in rows]
+
+    def claim_inbound(self, message_id: str) -> bool:
+        conn = self._get_connection()
+        with conn:
+            result = conn.execute(
+                "UPDATE inbound_delivery SET state = 'dispatching' "
+                "WHERE message_id = ? AND state = 'pending'",
+                (message_id,),
+            )
+        return result.rowcount == 1
+
+    def complete_inbound(self, message_id: str) -> None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                "DELETE FROM inbound_delivery WHERE message_id = ? AND state = 'dispatching'",
+                (message_id,),
             )
 
     def get_messages(

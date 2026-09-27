@@ -60,6 +60,12 @@ def harness_env():
     mbx_mgr = MailboxManager()
     coord = HarnessCoordinator(store, mbx_mgr)
     dispatcher = Dispatcher(store, coord, mbx_mgr)
+    coord.register_adapter("kanaloa", MockAdapter(
+        capabilities=AgentCapabilities(branch_mode="replay")
+    ))
+    coord.register_adapter("mock", MockAdapter(
+        capabilities=AgentCapabilities(branch_mode="replay")
+    ))
     return store, mbx_mgr, coord, dispatcher
 
 

@@ -158,6 +158,10 @@ class Dispatcher:
             raise ValueError(
                 f"Message '{message_id}' belongs to conversation '{msg.conversation_id}', not '{conversation_id}'"
             )
+        if not self.coordinator.has_adapter(conv.bound_agent_id):
+            raise ValueError(f"Agent '{conv.bound_agent_id}' is not available for branching")
+        if self.coordinator.get_adapter(conv.bound_agent_id).capabilities().branch_mode == "unsupported":
+            raise ValueError(f"Agent '{conv.bound_agent_id}' does not support branching")
 
         branch = BranchBoundary(
             conversation_id=conversation_id,
@@ -293,12 +297,21 @@ class Dispatcher:
         reply_to_message_id: str | None = None,
         parent_id: str | None = None,
         is_new_task: bool = False,
+        loop_mode: bool = False,
+        max_iterations: int | None = 5,
     ) -> tuple[Message, Turn]:
         """
         Dispatch a user message to the conversation and target Turn.
         Resolves turn deterministically, appends user message with bound turn_id to store,
         and routes according to adapter capabilities.
         """
+        if loop_mode:
+            conv = self.store.get_conversation(conversation_id)
+            if conv and conv.bound_agent_id != "kanaloa":
+                raise ValueError("Loop Mode is only available for Kanaloa")
+            if max_iterations is not None and (type(max_iterations) is not int or max_iterations <= 0):
+                raise ValueError("max_iterations must be null or a positive integer")
+
         # 1. Deterministic Turn Resolution first
         if is_new_task:
             turn = self.create_new_turn(conversation_id)
@@ -308,6 +321,29 @@ class Dispatcher:
                 explicit_turn_id=target_turn_id,
                 reply_to_message_id=reply_to_message_id,
             )
+
+        adapter = self.coordinator.get_adapter(turn.bound_agent_id)
+        caps = adapter.capabilities()
+        if turn.branch_id != "main" and caps.branch_mode == "unsupported":
+            raise ValueError(f"Agent '{turn.bound_agent_id}' does not support branching")
+        if loop_mode:
+            if turn.bound_agent_id != "kanaloa":
+                raise ValueError("Loop Mode is only available for Kanaloa")
+
+        needs_initial_send = False
+        if turn.status == "running" and hasattr(adapter, "get_native_session"):
+            needs_initial_send = not (turn.native_session_ref or adapter.get_native_session(turn.turn_id))
+        if loop_mode and turn.status == "running" and not needs_initial_send:
+            raise ValueError("Loop Mode must be selected before a Turn starts or on a follow-up")
+        if loop_mode and turn.status == "waiting_user":
+            raise ValueError("Loop Mode cannot replace an in-flight approval")
+
+        queued_kind = None
+        if turn.status == "running" and not needs_initial_send:
+            if caps.steer_mode == "safe_boundary":
+                queued_kind = "steer"
+            elif caps.steer_mode == "follow_up_only":
+                queued_kind = "message"
 
         # Resolve effective parent_id for branch lineage
         effective_parent_id = parent_id
@@ -349,11 +385,7 @@ class Dispatcher:
             parent_id=effective_parent_id,
             content=content,
         )
-        self.store.append_message(user_msg)
-
-        # 3. Resolve Adapter and Capabilities
-        adapter = self.coordinator.get_adapter(turn.bound_agent_id)
-        caps = adapter.capabilities()
+        self.store.append_message(user_msg, delivery_kind=queued_kind)
 
         # 4. Turn Status Lifecycle Handling
         if turn.status in ("finished", "failed", "interrupted"):
@@ -365,7 +397,10 @@ class Dispatcher:
             self.store.save_turn(turn)
 
             history = [m for m in self.get_turn_history(turn) if m.message_id != user_msg.message_id]
-            await adapter.send(turn, user_msg, history)
+            if loop_mode:
+                await adapter.send(turn, user_msg, history, max_iterations=max_iterations)
+            else:
+                await adapter.send(turn, user_msg, history)
 
         elif turn.status == "waiting_user":
             # Resume waiting turn
@@ -380,15 +415,12 @@ class Dispatcher:
             # If the adapter manages native sessions and no native session has been established yet for this turn
             # (e.g. initial message for a brand new turn or a newly created branch turn),
             # this message is the turn's initial bootstrap send, not a mid-flight steer.
-            needs_initial_send = False
-            if hasattr(adapter, "get_native_session"):
-                native_sess = turn.native_session_ref or adapter.get_native_session(turn.turn_id)
-                if not native_sess:
-                    needs_initial_send = True
-
             if needs_initial_send:
                 history = [m for m in self.get_turn_history(turn) if m.message_id != user_msg.message_id]
-                await adapter.send(turn, user_msg, history)
+                if loop_mode:
+                    await adapter.send(turn, user_msg, history, max_iterations=max_iterations)
+                else:
+                    await adapter.send(turn, user_msg, history)
             else:
                 # Turn is actively running -> Steer Degradation
                 steer_mode = caps.steer_mode
@@ -423,6 +455,8 @@ class Dispatcher:
 
     async def _handle_queued_followup(self, turn: Turn, followup_msg: Message) -> None:
         """Triggered by Coordinator when a turn finishes with pending follow-up in mailbox."""
+        if not self.store.claim_inbound(followup_msg.message_id):
+            return
         adapter = self.coordinator.get_adapter(turn.bound_agent_id)
         turn.status = "running"
         turn.finished_at = None
@@ -431,7 +465,12 @@ class Dispatcher:
         self.store.save_turn(turn)
 
         history = [m for m in self.get_turn_history(turn) if m.message_id != followup_msg.message_id]
-        await adapter.send(turn, followup_msg, history)
+        try:
+            await adapter.send(turn, followup_msg, history)
+        except Exception as exc:
+            await self.coordinator.emit_interrupted(turn.turn_id, reason=f"delivery_outcome_unknown:{exc}")
+            return
+        self.store.complete_inbound(followup_msg.message_id)
 
     async def cancel_turn(self, turn_id: str, reason: str = "cancelled_by_user") -> Turn:
         """Abort/cancel an active Turn. Enforces supports_cancel capability gate."""
@@ -446,8 +485,11 @@ class Dispatcher:
                 f"Agent adapter '{turn.bound_agent_id}' does not support cancellation"
             )
 
-        await adapter.cancel(turn)
-        await self.coordinator.emit_interrupted(turn_id, reason=reason)
+        try:
+            await adapter.cancel(turn)
+        finally:
+            if self.coordinator.is_turn_active(turn_id):
+                await self.coordinator.emit_interrupted(turn_id, reason=reason)
         return self.store.get_turn(turn_id)  # Refresh from store
 
     async def resume_turn(self, turn_id: str) -> Turn:
@@ -469,7 +511,11 @@ class Dispatcher:
         self.store.save_turn(turn)
 
         history = self.get_turn_history(turn)
-        await adapter.resume(turn, history)
+        try:
+            await adapter.resume(turn, history)
+        except Exception as exc:
+            await self.coordinator.emit_interrupted(turn_id, reason=f"resume_transport:{exc}")
+            raise
         return self.store.get_turn(turn_id)
 
     def stop_loop(self, turn_id: str) -> Turn:

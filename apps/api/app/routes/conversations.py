@@ -25,6 +25,8 @@ class SendMessageRequest(BaseModel):
     content: str
     turn_id: str | None = None
     reply_to_message_id: str | None = None
+    loop_mode: bool = False
+    max_iterations: int | None = Field(default=5, gt=0)
 
 
 class SendMessageResponse(BaseModel):
@@ -133,6 +135,8 @@ async def send_message(
         raise HTTPException(
             status_code=404, detail=f"Conversation '{conversation_id}' not found"
         )
+    if not body.loop_mode and "max_iterations" in body.model_fields_set:
+        raise HTTPException(status_code=400, detail="max_iterations requires loop_mode=true")
 
     try:
         user_msg, turn = await dispatcher.dispatch_user_message(
@@ -140,6 +144,8 @@ async def send_message(
             content=body.content,
             target_turn_id=body.turn_id,
             reply_to_message_id=body.reply_to_message_id,
+            loop_mode=body.loop_mode,
+            max_iterations=body.max_iterations,
         )
         return SendMessageResponse(message=user_msg, turn=turn)
     except ValueError as exc:

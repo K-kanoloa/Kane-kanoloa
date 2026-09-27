@@ -73,6 +73,7 @@ class KanaloaAdapter(BaseAdapter):
         command: list[str] | None = None,
         cwd: str | None = None,
         event_handler: AgentEventHandler | None = None,
+        runtime: KanaloaRuntime | None = None,
     ) -> None:
         super().__init__(event_handler)
         self.cwd = cwd or os.getcwd()
@@ -105,7 +106,7 @@ class KanaloaAdapter(BaseAdapter):
         self._is_initialized = False
         self._lock = asyncio.Lock()
         self._pending_permissions: dict[str, PendingPermissionRequest] = {}
-        self.runtime = KanaloaRuntime()
+        self.runtime = runtime or KanaloaRuntime()
 
         # Audit properties for testing & verification
         self.last_sent_payload: dict[str, Any] | None = None
@@ -505,10 +506,16 @@ class KanaloaAdapter(BaseAdapter):
             self._pending_permissions.pop(k, None)
 
         for turn_id in turns_to_interrupt:
-            await self.event_handler.emit_interrupted(
-                turn_id,
-                reason=f"permission_invalidated:{reason}",
-            )
+            if self.event_handler.is_turn_active(turn_id):
+                await self.event_handler.emit_interrupted(
+                    turn_id,
+                    reason=f"permission_invalidated:{reason}",
+                )
+
+        if session_id is None:
+            for turn_id in set(self._session_turns.values()) - turns_to_interrupt:
+                if self.event_handler.is_turn_active(turn_id):
+                    await self.event_handler.emit_interrupted(turn_id, reason=reason)
 
         # Reject pending RPC requests fail-closed so awaiting futures do not hang indefinitely (P1-01)
         if session_id is None:
@@ -577,18 +584,27 @@ class KanaloaAdapter(BaseAdapter):
                         f"Invalid max_iterations '{max_iterations}': must be None or a positive integer"
                     )
 
-        await self._ensure_process()
+        try:
+            await self._ensure_process()
+        except Exception as exc:
+            await self.event_handler.emit_interrupted(turn.turn_id, reason=f"acp_transport:{exc}")
+            raise RuntimeError(f"ACP transport unavailable: {exc}") from exc
 
         session_id = turn.native_session_ref or self.get_native_session(turn.turn_id)
 
         # State B: Session New / Rebuild
         if not session_id or session_id not in self._active_sessions:
             # 1. Create native ACP session
-            new_resp = await self._send_request("session/new", {
-                "cwd": self.cwd,
-                "mcpServers": [],
-            })
+            try:
+                new_resp = await self._send_request("session/new", {
+                    "cwd": self.cwd,
+                    "mcpServers": [],
+                })
+            except Exception as exc:
+                await self.event_handler.emit_interrupted(turn.turn_id, reason=f"acp_session:{exc}")
+                raise RuntimeError(f"ACP session unavailable: {exc}") from exc
             if "error" in new_resp:
+                await self.event_handler.emit_interrupted(turn.turn_id, reason="acp_session_new_failed")
                 raise RuntimeError(f"ACP session/new failed: {new_resp['error']}")
 
             session_id = new_resp["result"]["sessionId"]
@@ -686,7 +702,7 @@ class KanaloaAdapter(BaseAdapter):
             })
             if "error" in resp:
                 err_msg = resp["error"].get("message", "ACP prompt error")
-                await self.event_handler.emit_failed(turn_id, reason=str(err_msg))
+                await self.event_handler.emit_interrupted(turn_id, reason=f"acp_protocol:{err_msg}")
                 return
 
             result = resp.get("result", {})
@@ -695,6 +711,10 @@ class KanaloaAdapter(BaseAdapter):
 
             if stop_reason == "cancelled":
                 await self.event_handler.emit_interrupted(turn_id, reason="cancelled_by_acp")
+            elif stop_reason == "failed":
+                await self.event_handler.emit_failed(
+                    turn_id, reason=str(result.get("failureReason") or "agent_reported_failure")
+                )
             else:
                 # Normal completion
                 await self.event_handler.emit_message_complete(
@@ -703,7 +723,8 @@ class KanaloaAdapter(BaseAdapter):
                 )
         except Exception as e:
             logger.error("KanaloaAdapter prompt execution exception: %s", e)
-            await self.event_handler.emit_failed(turn_id, reason=str(e))
+            if self.event_handler.is_turn_active(turn_id):
+                await self.event_handler.emit_interrupted(turn_id, reason=f"acp_transport:{e}")
 
     def stop_loop(self, turn: Turn) -> None:
         """Signal runtime to gracefully stop continuing loop after current iteration."""
@@ -730,10 +751,15 @@ class KanaloaAdapter(BaseAdapter):
 
         self.runtime.record_steer(turn.turn_id, message.content)
 
-        resp = await self._send_request("session/steer", {
-            "sessionId": session_id,
-            "prompt": [{"type": "text", "text": message.content}],
-        })
+        try:
+            resp = await self._send_request("session/steer", {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": message.content}],
+            })
+        except Exception as exc:
+            if self.event_handler.is_turn_active(turn.turn_id):
+                await self.event_handler.emit_interrupted(turn.turn_id, reason=f"acp_transport:{exc}")
+            raise RuntimeError(f"ACP steer transport unavailable: {exc}") from exc
         if "error" in resp:
             err_msg = resp["error"].get("message", str(resp["error"]))
             raise RuntimeError(f"DSH steer failed: {err_msg}")

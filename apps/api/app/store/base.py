@@ -9,7 +9,7 @@ without touching Harness logic.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Sequence
+from typing import Literal, Sequence
 
 from ..domain.models import (
     AgentBinding,
@@ -63,8 +63,27 @@ class BaseStore(ABC):
 
     # --- Message Operations (Append-Only) ---
     @abstractmethod
-    def append_message(self, message: Message) -> None:
-        """Append a new message. Historical records cannot be overwritten."""
+    def append_message(
+        self,
+        message: Message,
+        delivery_kind: Literal["message", "steer"] | None = None,
+    ) -> None:
+        """Append a message and, when queued, its delivery intent atomically."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_unsettled_inbound(self) -> list[tuple[str, str, str, str]]:
+        """Return (message_id, turn_id, kind, state) for pending/uncertain input."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def claim_inbound(self, message_id: str) -> bool:
+        """Claim pending input before sending it to an adapter."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def complete_inbound(self, message_id: str) -> None:
+        """Clear an input after the adapter accepts it."""
         raise NotImplementedError
 
     @abstractmethod
