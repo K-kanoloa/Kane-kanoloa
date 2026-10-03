@@ -24,6 +24,10 @@ from ..domain.models import (
 class BaseStore(ABC):
     """Abstract store interface defining all persistence contracts."""
 
+    @abstractmethod
+    def delete_agent_binding(self, agent_id: str) -> None:
+        raise NotImplementedError
+
     # --- Branch Boundary Operations (§16, §17) ---
     @abstractmethod
     def save_branch(self, branch: BranchBoundary) -> None:
@@ -43,6 +47,15 @@ class BaseStore(ABC):
     @abstractmethod
     def get_or_create_main_branch(self, conversation_id: str) -> BranchBoundary:
         """Get or create the root main branch for a conversation."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def update_conversation_title(self, conversation_id: str, title: str) -> Conversation | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete_conversation(self, conversation_id: str) -> bool:
+        """Delete local records atomically; reject running/waiting_user Turns."""
         raise NotImplementedError
 
     # --- Conversation Operations ---
@@ -126,8 +139,8 @@ class BaseStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def list_running_turns(self) -> list[Turn]:
-        """List all turns currently in 'running' status across all conversations (for startup reconciliation)."""
+    def list_active_turns(self) -> list[Turn]:
+        """List running and waiting_user turns for startup liveness reconciliation."""
         raise NotImplementedError
 
     @abstractmethod
@@ -138,8 +151,7 @@ class BaseStore(ABC):
         status_event: TurnEvent | None = None,
     ) -> None:
         """
-        Atomically persist final Message, clear Turn partial_output, set Turn status to finished,
-        and optionally append completion TurnEvent in a single ACID transaction.
+        Atomically persist a logical Message and its Turn status/event in one transaction.
         """
         raise NotImplementedError
 

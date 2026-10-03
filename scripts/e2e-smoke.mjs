@@ -119,9 +119,11 @@ async function main() {
   const apiHealth = await checkEndpoint("api:health", `${apiBase}/health`);
   console.log(`[PASS] API health: ${apiHealth.status} (${apiHealth.elapsedMs}ms)`);
 
-  // 2. Check Bridge /health
-  const bridgeHealth = await checkEndpoint("bridge:health", `${bridgeBase}/health`);
-  console.log(`[PASS] Bridge health: ${bridgeHealth.status} (${bridgeHealth.elapsedMs}ms)`);
+  // The legacy bridge is optional, matching dev-stack and wait-for-stack.
+  if (process.argv.includes("--with-bridge")) {
+    const bridgeHealth = await checkEndpoint("bridge:health", `${bridgeBase}/health`);
+    console.log(`[PASS] Bridge health: ${bridgeHealth.status} (${bridgeHealth.elapsedMs}ms)`);
+  }
 
   // Read-only workspace check; agent execution belongs to test:e2e:ui.
   let chromium;

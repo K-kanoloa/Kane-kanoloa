@@ -1,90 +1,64 @@
-# Kane Agent Platform v2.0.0 Release Notes
+# Kane-Kanaloa v0.1.0-beta
 
-Kane Agent Platform v2.0.0 is the first public release readiness milestone for the local-first Agent OS foundation.
+Date: 2026-10-03 (Australia/Sydney). Early evaluation release on
+`vnext/thin-harness`. **Known or unknown bugs may exist.** Not production,
+security, universal Agent compatibility or full product certification.
+Historical main/v2 tags are preserved; this release does not replace main.
 
-## Release Classification
+## Scope
 
-This release is:
+Thin model-free Kane Harness, bundled Kanaloa/modified DSH Runtime, current
+Web control UI, unified external Connector endpoint, generic Skill/MCP bootstrap,
+shared conformance and Codex reference. Agent execution remains outside Kane Core.
+No feature development or architecture refactor was performed during release preparation.
 
-- `Kane Agent Platform v2.0.0`
-- local-first
-- public repository ready
-- suitable for local/private evaluation and development
+## Release Checks
 
-This release is not:
+- Web typecheck: PASS.
+- Existing read-only stack smoke: PASS; API health 200, Web 200, no observed
+  browser console errors or bad HTTP responses.
+- Secret scan: no real secrets found in publishable files or new branch history.
+  Test placeholders were reviewed.
+- Git integrity: PASS. Dangling objects are not repository corruption.
+- Runtime databases, credentials, local .env, logs, caches and account data
+  are not uploaded. The tracked .env.example contains placeholders.
+- Upstream DSH MIT notice preserved in THIRD_PARTY_NOTICES.md. Installed DSH
+  packages retain LICENSE files; node_modules and virtual environments are excluded.
 
-- a hosted public SaaS
-- a credential vault
-- a connected accounts platform
-- a multi-bridge production mesh
-- a RAG/vector retrieval framework
-- a workflow engine
+No full API, Bridge, MCP, Connector, UI or real model/crash suite was rerun
+as a release gate. No fresh-machine or all-Agent acceptance was performed.
 
-## What Works In v2.0.0
+## Earlier Evidence, Not A Fresh Release Retest
 
-- Web, API, and Local Bridge can run together with `npm run dev:stack`.
-- `npm run wait:stack` verifies that the local stack is reachable.
-- `npm run test:e2e:smoke` performs repeatable browser smoke coverage against the real local stack.
-- Tasks create execution attempts as runs.
-- Runs contain run steps for the execution timeline.
-- Execution Audit exposes run timeline, reference aggregation, verifier, repair, compiler, memory, and retrieval panels.
-- Builtin tasks converge task, run, and run-step terminal state.
-- Codex CLI adapter status and permission failures are reported honestly.
-- Cursor is supported as a handoff-oriented adapter.
-- Memory events are append-only for AI writes by default.
-- Background Memory Compiler creates candidates first and commits only by explicit action through the ledger append path.
-- stop / restore guidance prevents restoring runtime data while API or Bridge is live.
+The 2026-10-01 acceptance recorded API 191 PASS / 0 SKIP, Bridge 4 PASS,
+Web typecheck PASS, MCP 4 PASS, conformance 7 PASS and Codex reference regression
+6 PASS. Real Kanaloa PONG, session continuity, two-cycle Loop, Tool success,
+process-tree crash recovery and delayed completion after Cancel were exercised
+using saved Provider configuration. These results do not guarantee another environment.
 
-## Verification
+Approval was NOT_TRIGGERED, not fabricated as PASS. Subagent crash injection
+terminated the shared Runtime process tree during child work; it was not an
+isolated independent child-process crash test.
 
-Recommended release verification:
+## Known Limitations / Untested Areas
 
-```bash
-npm install
-npm run setup
-npm run typecheck:web
-npm run test:api
-npm run test:bridge
-npm run dev:stack
-npm run wait:stack
-npm run test:e2e:smoke
-npm run stop:stack
-```
+- Session rebind is not unfinished work resume. Unknown outcomes stay interrupted;
+  no blind rerun or side-effect rollback is promised.
+- Continuable child recovery does not guarantee automatic resumed execution.
+- Provider/network errors, permissions and Tool/IPython installation remain
+  deployment-dependent.
+- Pairing/registry presence is not a live compatible Agent-side Connector.
+- UI model setup focuses on OpenAI-compatible Base URL/Model/API Key; not every
+  Backend option has a UI control.
+- All external Agents, fresh install, cross-machine reconnect, production
+  deployment, load/security testing and full UI suite were not retested here.
+- Historical docs and package/API version strings may still report v2.0.0.
+  This release's identity is v0.1.0-beta.
+- Never expose the default local unauthenticated service to the Internet.
 
-Human acceptance should click through:
+## Data And Licensing
 
-```text
-Dashboard
-Conversation
-Settings
-Builtin Task
-Task Detail
-Execution Audit
-Run Timeline
-Codex Agent
-Cursor Agent
-Memory
-Bridge
-Agent Fleet
-Dashboard
-Stop Stack
-Restore
-Verify Ports Down
-```
-
-## Known Boundaries
-
-- Local model replies require an active model profile or process-level provider key.
-- Cursor is not reported as full headless execution unless a real result/callback is received.
-- Codex CLI execution depends on local CLI availability and OS permissions.
-- The existing `OCTOPUS_*` environment variable and compatibility header names remain in v2.0.0 to avoid breaking local deployments.
-- Some internal compatibility IDs still contain legacy names; public UI and docs use Kane v2.0.0 positioning.
-
-## Deferred To Later Releases
-
-- Connected Accounts.
-- Credential Vault.
-- Multi-Bridge production architecture.
-- New MCP capabilities.
-- Vector / embedding / graph retrieval.
-- Hosted multi-tenant deployment hardening.
+Breaking architecture baseline relative to v2. No automatic legacy data import
+is promised. Back up databases and configuration before upgrading.
+Historical releases are retained. Project license status remains UNLICENSED;
+dependency attribution is in THIRD_PARTY_NOTICES.md.

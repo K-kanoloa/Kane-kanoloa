@@ -124,9 +124,9 @@ It does not ship vector database, embedding, or graph retrieval as default behav
 
 ## Local Bridge
 
-Local Bridge is optional for builtin execution, but required for local external adapter flows such as Codex CLI, Cursor handoff, Claude CLI, local scripts, and generic HTTP/CLI agents.
+The Local Bridge section below describes the frozen v2.0.0 task-execution path only. Kane vNext external Agents connect through the generic Agent-side Connector and `KANE_CONNECTOR_PROTOCOL.md`; Kane Core does not discover or launch vendor CLIs.
 
-The Bridge must not pretend unavailable tools are online. Permission errors and missing CLIs are reported honestly.
+The v2 Bridge must not pretend unavailable tools are online. Permission errors and missing CLIs are reported honestly.
 
 ## Persistence
 

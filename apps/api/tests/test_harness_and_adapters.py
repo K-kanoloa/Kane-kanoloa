@@ -282,6 +282,144 @@ async def test_turn_resumption_from_finished_failed_interrupted(harness_env):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("steer_mode", ["native", "safe_boundary", "follow_up_only"])
+async def test_first_message_uses_send_for_generic_adapter(harness_env, steer_mode):
+    store, mailboxes, coordinator, dispatcher = harness_env
+    adapter = MockAdapter(capabilities=AgentCapabilities(steer_mode=steer_mode))
+    coordinator.register_adapter("generic", adapter)
+    store.save_conversation(Conversation(conversation_id="first", bound_agent_id="generic"))
+
+    message, turn = await dispatcher.dispatch_user_message("first", "Hello")
+
+    assert adapter.sent_calls[0]["message"].message_id == message.message_id
+    assert adapter.steer_calls == []
+    assert turn.status == "running"
+    assert mailboxes.get_mailbox(turn.turn_id).is_empty
+
+
+@pytest.mark.asyncio
+async def test_first_message_to_precreated_native_session_is_send(harness_env):
+    store, _, coordinator, dispatcher = harness_env
+    adapter = MockAdapter(capabilities=AgentCapabilities(steer_mode="native"))
+    coordinator.register_adapter("native", adapter)
+    store.save_conversation(Conversation(conversation_id="forked", bound_agent_id="native",
+                                         focus_turn_id="forked_turn"))
+    store.save_turn(Turn(turn_id="forked_turn", conversation_id="forked",
+                         bound_agent_id="native", native_session_ref="isolated_session"))
+
+    await dispatcher.dispatch_user_message("forked", "First branch prompt")
+
+    assert len(adapter.sent_calls) == 1
+    assert adapter.steer_calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_question_is_one_persistent_message(harness_env):
+    store, _, coordinator, _ = harness_env
+    store.save_conversation(Conversation(conversation_id="question", bound_agent_id="generic"))
+    store.save_turn(Turn(turn_id="question_turn", conversation_id="question", bound_agent_id="generic"))
+
+    await coordinator.emit_delta("question_turn", "I found two approaches.")
+    await coordinator.emit_waiting_user("question_turn", "Which option should I use?")
+
+    messages = store.get_messages("question")
+    assert len(messages) == 1
+    assert messages[0].content == "I found two approaches.\n\nWhich option should I use?"
+    assert store.get_turn("question_turn").status == "waiting_user"
+    assert store.get_turn("question_turn").partial_output is None
+    assert store.list_events("question_turn")[-1].payload["message_id"] == messages[0].message_id
+
+
+@pytest.mark.asyncio
+async def test_stage_message_does_not_finish_turn(harness_env):
+    store, mailboxes, coordinator, _ = harness_env
+    store.save_conversation(Conversation(conversation_id="stage", bound_agent_id="generic"))
+    store.save_turn(Turn(turn_id="stage_turn", conversation_id="stage", bound_agent_id="generic"))
+    mailboxes.get_mailbox("stage_turn").put_nowait(MailboxItem(
+        turn_id="stage_turn", item_type="message", payload={"message_id": "later"},
+    ))
+
+    message = await coordinator.emit_message_complete("stage_turn", content="First finding", turn_finished=False)
+
+    assert store.get_turn("stage_turn").status == "running"
+    assert store.get_messages("stage")[0].message_id == message.message_id
+    assert mailboxes.get_mailbox("stage_turn").pending_count == 1
+
+
+@pytest.mark.asyncio
+async def test_parallel_capability_blocks_second_execution(harness_env):
+    store, _, coordinator, dispatcher = harness_env
+    adapter = MockAdapter(capabilities=AgentCapabilities(supports_parallel_sessions=False))
+    coordinator.register_adapter("serial", adapter)
+    store.save_conversation(Conversation(conversation_id="serial_conv", bound_agent_id="serial"))
+    await dispatcher.dispatch_user_message("serial_conv", "First work")
+    second = dispatcher.create_new_turn("serial_conv")
+
+    with pytest.raises(RuntimeError, match="no available parallel session"):
+        await dispatcher.dispatch_user_message("serial_conv", "Second work", target_turn_id=second.turn_id)
+
+    assert len(adapter.sent_calls) == 1
+    assert len([m for m in store.get_messages("serial_conv") if m.sender == "user"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_reported_failure_is_not_reclassified_as_interruption(harness_env):
+    store, _, coordinator, dispatcher = harness_env
+    adapter = MockAdapter()
+    coordinator.register_adapter("generic", adapter)
+    store.save_conversation(Conversation(conversation_id="failed_agent", bound_agent_id="generic"))
+
+    async def fail_after_reporting(_adapter, turn, _message, _history):
+        await coordinator.emit_failed(turn.turn_id, "agent_reported_failure")
+        raise RuntimeError("Agent already reported failure")
+
+    adapter.on_send_behavior = fail_after_reporting
+    with pytest.raises(RuntimeError, match="already reported"):
+        await dispatcher.dispatch_user_message("failed_agent", "Do work")
+
+    turn = store.list_turns("failed_agent")[0]
+    assert turn.status == "failed"
+    assert turn.interrupt_reason == "agent_reported_failure"
+
+
+def test_missing_bundled_dsh_never_falls_back_to_npx(monkeypatch, tmp_path):
+    import os
+    original_exists = os.path.exists
+    monkeypatch.setattr(
+        os.path, "exists",
+        lambda path: False if str(path).endswith(os.path.join("dsh", "lib", "bin.js")) else original_exists(path),
+    )
+    adapter = KanaloaAdapter(cwd=str(tmp_path))
+
+    assert adapter.is_available() is False
+    assert adapter.command[0] == "node"
+    assert "npx" not in adapter.command[0]
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_thought_event_does_not_persist_reasoning_text(harness_env):
+    store, _, coordinator, _ = harness_env
+    store.save_conversation(Conversation(conversation_id="thought", bound_agent_id="kanaloa"))
+    store.save_turn(Turn(turn_id="thought_turn", conversation_id="thought", bound_agent_id="kanaloa"))
+    adapter = KanaloaAdapter(event_handler=coordinator)
+    adapter.bind_session("thought_turn", "thought_session")
+
+    await adapter._handle_session_update({
+        "sessionId": "thought_session",
+        "update": {
+            "sessionUpdate": "agent_thought_chunk",
+            "messageId": "msg_thought_1",
+            "content": {"type": "text", "text": "private reasoning must not be stored"},
+        },
+    })
+
+    event = store.list_events("thought_turn")[0]
+    assert event.event_type == "thinking"
+    assert event.payload == {"status": "thinking"}
+    assert store.get_turn("thought_turn").partial_output is None
+
+
+@pytest.mark.asyncio
 async def test_steer_degradation_modes(harness_env):
     """
     Verify steer degradation according to AgentCapabilities.steer_mode:
@@ -304,8 +442,10 @@ async def test_steer_degradation_modes(harness_env):
         conversation_id="c_native",
         bound_agent_id="agent_native",
         status="running",
+        native_session_ref="sess_native",
     )
     store.save_turn(turn1)
+    store.append_message(Message(conversation_id="c_native", turn_id="t_native", sender="user", content="Initial prompt"))
     conv1.focus_turn_id = "t_native"
     store.save_conversation(conv1)
 
@@ -327,8 +467,10 @@ async def test_steer_degradation_modes(harness_env):
         conversation_id="c_safe",
         bound_agent_id="agent_safe",
         status="running",
+        native_session_ref="sess_safe",
     )
     store.save_turn(turn2)
+    store.append_message(Message(conversation_id="c_safe", turn_id="t_safe", sender="user", content="Initial prompt"))
     conv2.focus_turn_id = "t_safe"
     store.save_conversation(conv2)
 
@@ -366,8 +508,10 @@ async def test_steer_degradation_modes(harness_env):
         conversation_id="c_followup",
         bound_agent_id="agent_followup",
         status="running",
+        native_session_ref="sess_followup",
     )
     store.save_turn(turn3)
+    store.append_message(Message(conversation_id="c_followup", turn_id="t_followup", sender="user", content="Initial prompt"))
     conv3.focus_turn_id = "t_followup"
     store.save_conversation(conv3)
 
@@ -397,8 +541,10 @@ async def test_steer_degradation_modes(harness_env):
         conversation_id="c_followup",
         bound_agent_id="agent_followup",
         status="running",
+        native_session_ref="sess_followup_fail",
     )
     store.save_turn(turn3_fail)
+    store.append_message(Message(conversation_id="c_followup", turn_id="t_followup_fail", sender="user", content="Initial prompt"))
     conv3.focus_turn_id = "t_followup_fail"
     store.save_conversation(conv3)
 
@@ -411,6 +557,96 @@ async def test_steer_degradation_modes(harness_env):
     await coord.emit_failed("t_followup_fail", reason="Engine error")
     await asyncio.sleep(0.01)
     assert mbx_fail.pending_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_initial_input_delivered_once_after_restart():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "kane.db"
+        store = SQLiteStore(db_path)
+        conv = Conversation(conversation_id="first_recovery", bound_agent_id="generic")
+        turn = Turn(turn_id="first_turn", conversation_id=conv.conversation_id,
+                    bound_agent_id="generic", status="running")
+        store.save_conversation(conv)
+        store.save_turn(turn)
+        message = Message(conversation_id=conv.conversation_id, turn_id=turn.turn_id,
+                          sender="user", content="Start this work")
+        store.append_message(message, delivery_kind="message")
+        store.close()
+
+        reopened = SQLiteStore(db_path)
+        mailboxes = MailboxManager()
+        coordinator = HarnessCoordinator(reopened, mailboxes)
+        Dispatcher(reopened, coordinator, mailboxes)
+        adapter = MockAdapter()
+        coordinator.register_adapter("generic", adapter)
+
+        await coordinator.reconcile_startup_turns()
+
+        assert [call["message"].message_id for call in adapter.sent_calls] == [message.message_id]
+        assert reopened.list_unsettled_inbound() == []
+        assert reopened.get_turn(turn.turn_id).status == "running"
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_claimed_initial_input_is_not_replayed_after_restart():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "kane.db"
+        store = SQLiteStore(db_path)
+        conv = Conversation(conversation_id="uncertain_first", bound_agent_id="generic")
+        turn = Turn(turn_id="uncertain_turn", conversation_id=conv.conversation_id,
+                    bound_agent_id="generic", status="running")
+        store.save_conversation(conv)
+        store.save_turn(turn)
+        message = Message(conversation_id=conv.conversation_id, turn_id=turn.turn_id,
+                          sender="user", content="May have executed")
+        store.append_message(message, delivery_kind="message")
+        assert store.claim_inbound(message.message_id)
+        store.close()
+
+        reopened = SQLiteStore(db_path)
+        mailboxes = MailboxManager()
+        coordinator = HarnessCoordinator(reopened, mailboxes)
+        Dispatcher(reopened, coordinator, mailboxes)
+        adapter = MockAdapter()
+        coordinator.register_adapter("generic", adapter)
+
+        await coordinator.reconcile_startup_turns()
+
+        assert adapter.sent_calls == []
+        assert reopened.get_turn(turn.turn_id).status == "interrupted"
+        assert reopened.list_unsettled_inbound()[0][3] == "dispatching"
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_initial_input_waits_when_adapter_is_missing():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "kane.db"
+        store = SQLiteStore(db_path)
+        conv = Conversation(conversation_id="offline_first", bound_agent_id="offline")
+        turn = Turn(turn_id="offline_turn", conversation_id=conv.conversation_id,
+                    bound_agent_id="offline", status="running")
+        store.save_conversation(conv)
+        store.save_turn(turn)
+        message = Message(conversation_id=conv.conversation_id, turn_id=turn.turn_id,
+                          sender="user", content="Do not lose this")
+        store.append_message(message, delivery_kind="message")
+        store.close()
+
+        reopened = SQLiteStore(db_path)
+        mailboxes = MailboxManager()
+        coordinator = HarnessCoordinator(reopened, mailboxes)
+        Dispatcher(reopened, coordinator, mailboxes)
+
+        await coordinator.reconcile_startup_turns()
+
+        assert reopened.get_turn(turn.turn_id).status == "interrupted"
+        assert reopened.list_unsettled_inbound() == [
+            (message.message_id, turn.turn_id, "message", "pending")
+        ]
+        reopened.close()
 
 
 @pytest.mark.asyncio
@@ -429,6 +665,8 @@ async def test_queued_inbound_survives_store_restart():
                     bound_agent_id="agent_safe", native_session_ref="native_live")
         store.save_conversation(conv)
         store.save_turn(turn)
+        store.append_message(Message(conversation_id=conv.conversation_id, turn_id=turn.turn_id,
+                                     sender="user", content="Initial prompt"))
         message, _ = await dispatcher.dispatch_user_message(conv.conversation_id, "Apply at next boundary")
         assert store.list_unsettled_inbound() == [(message.message_id, turn.turn_id, "steer", "pending")]
         store.close()
@@ -445,7 +683,7 @@ async def test_queued_inbound_survives_store_restart():
         await recovered.emit_boundary_signal(turn.turn_id)
         assert [call["message"].message_id for call in adapter.steer_calls] == [message.message_id]
         assert reopened.list_unsettled_inbound() == []
-        assert len(reopened.get_messages(conv.conversation_id)) == 1
+        assert len(reopened.get_messages(conv.conversation_id)) == 2
         reopened.close()
 
 
@@ -699,50 +937,111 @@ async def test_kanaloa_adapter_event_normalization(harness_env):
     store.save_turn(turn)
     kanaloa.bind_session("t_norm", "sess_norm_1")
 
-    # 1. Delta normalization via session/update
+    # 1. Delta normalization via real ACP session/update (sessionUpdate: agent_message_chunk)
     await kanaloa._handle_session_update({
         "sessionId": "sess_norm_1",
         "update": {
-            "type": "content",
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "msg_norm_1",
             "content": {"type": "text", "text": "Step 1: Analyzing repo with DSH..."},
         },
     })
     assert store.get_turn("t_norm").partial_output == "Step 1: Analyzing repo with DSH..."
 
-    # 2. Thinking normalization (coarse live status, not bloating turn_events)
+    # 1b. Sequential delta aggregation across multiple message chunks
     await kanaloa._handle_session_update({
         "sessionId": "sess_norm_1",
         "update": {
-            "type": "thought",
-            "thought": "Deep reasoning intermediate steps...",
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "msg_norm_1",
+            "content": {"type": "text", "text": " Step 2: Verification complete."},
+        },
+    })
+    assert store.get_turn("t_norm").partial_output == "Step 1: Analyzing repo with DSH... Step 2: Verification complete."
+
+    # 2. Thinking normalization (sessionUpdate: agent_thought_chunk; coarse live status, zero thought text in partial_output)
+    await kanaloa._handle_session_update({
+        "sessionId": "sess_norm_1",
+        "update": {
+            "sessionUpdate": "agent_thought_chunk",
+            "messageId": "msg_norm_1",
+            "content": {"type": "text", "text": "Deep reasoning intermediate steps must never leak into message..."},
         },
     })
     events = store.list_events("t_norm")
     assert any(e.event_type == "thinking" and e.payload.get("status") == "thinking" for e in events)
+    # partial_output is NOT polluted by thought text
+    assert store.get_turn("t_norm").partial_output == "Step 1: Analyzing repo with DSH... Step 2: Verification complete."
 
-    # 3. Tool event normalization
+    # 3. Usage update normalization (safely ignored, never pollutes partial_output or crashes)
     await kanaloa._handle_session_update({
         "sessionId": "sess_norm_1",
         "update": {
-            "type": "tool_call",
-            "toolName": "bash",
-            "status": "executing",
+            "sessionUpdate": "usage_update",
+            "used": 1500,
+            "size": 32768,
+        },
+    })
+    assert store.get_turn("t_norm").partial_output == "Step 1: Analyzing repo with DSH... Step 2: Verification complete."
+
+    # 3b. Unknown update type safely ignored
+    await kanaloa._handle_session_update({
+        "sessionId": "sess_norm_1",
+        "update": {
+            "sessionUpdate": "custom_extension_chunk",
+            "foo": "bar",
+        },
+    })
+    assert store.get_turn("t_norm").partial_output == "Step 1: Analyzing repo with DSH... Step 2: Verification complete."
+
+    # 4. Tool event normalization via real ACP (sessionUpdate: tool_call and tool_call_update)
+    await kanaloa._handle_session_update({
+        "sessionId": "sess_norm_1",
+        "update": {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc_123",
+            "title": "bash",
+            "status": "in_progress",
+            "rawInput": {"command": "ls -la"},
         },
     })
     events = store.list_events("t_norm")
-    assert any(e.event_type == "tool_start" and e.payload.get("tool") == "bash" for e in events)
+    assert any(
+        e.event_type == "tool_start"
+        and e.payload.get("tool") == "bash"
+        and e.payload.get("tool_call_id") == "tc_123"
+        for e in events
+    )
 
-    # 4. Permission request normalization
+    await kanaloa._handle_session_update({
+        "sessionId": "sess_norm_1",
+        "update": {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc_123",
+            "status": "completed",
+        },
+    })
+    events = store.list_events("t_norm")
+    assert any(
+        e.event_type == "tool_end"
+        and e.payload.get("tool_call_id") == "tc_123"
+        and e.payload.get("status") == "completed"
+        for e in events
+    )
+
+    # 5. Permission request normalization
     await kanaloa._handle_permission_request({
+        "id": 42,
         "method": "session/request_permission",
         "params": {
             "sessionId": "sess_norm_1",
             "message": "Confirm file edit?",
+            "options": [{"optionId": "allow-once"}, {"optionId": "reject-once"}],
         },
     })
     assert store.get_turn("t_norm").status == "waiting_user"
 
-    # 5. Completion normalization
+    # 6. Completion normalization (aggregated deltas become exactly 1 Message, partial_output cleared)
     await kanaloa.event_handler.emit_message_complete(
         turn_id="t_norm",
         sender_id="kanaloa",
@@ -752,10 +1051,10 @@ async def test_kanaloa_adapter_event_normalization(harness_env):
     assert t_fin.partial_output is None
     msgs = store.get_messages("c_norm")
     assert len(msgs) == 1
-    assert msgs[0].content == "Step 1: Analyzing repo with DSH..."
+    assert msgs[0].content == "Step 1: Analyzing repo with DSH... Step 2: Verification complete."
     assert msgs[0].sender_id == "kanaloa"
 
-    # 6. Interrupted / Cancel normalization
+    # 7. Interrupted / Cancel normalization
     turn.status = "running"
     store.save_turn(turn)
     await kanaloa.event_handler.emit_interrupted("t_norm", reason="cancelled_by_acp")
@@ -772,7 +1071,7 @@ async def test_deterministic_message_turn_binding_and_reply_routing(harness_env)
     """
     store, mbx_mgr, coord, dispatcher = harness_env
 
-    mock_agent = MockAdapter()
+    mock_agent = MockAdapter(capabilities=AgentCapabilities(supports_parallel_sessions=True))
     coord.register_adapter("mock_agent", mock_agent)
 
     conv = Conversation(conversation_id="c_determ", bound_agent_id="mock_agent")
@@ -823,6 +1122,9 @@ class MockWireKanaloaAdapter(KanaloaAdapter):
     async def _ensure_process(self) -> None:
         self._is_initialized = True
 
+    async def _execute_prompt(self, turn_id: str, session_id: str, prompt_blocks: list[dict[str, Any]]) -> None:
+        self.sent_requests.append(("session/prompt", {"sessionId": session_id, "prompt": prompt_blocks}))
+
     async def _send_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
         if method == "session/cancel":
             self.cancel_notifs.append(params)
@@ -839,7 +1141,7 @@ class MockWireKanaloaAdapter(KanaloaAdapter):
             self.resumed_sessions.append(params)
             return {"result": {"configOptions": []}}
         if method == "session/prompt":
-            return {"result": {"stopReason": "end_turn"}}
+            return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
         if method == "session/steer":
             self.steer_requests.append(params)
             return {"result": {"accepted": True}}
@@ -934,8 +1236,8 @@ async def test_kanaloa_adapter_incremental_vs_bootstrap_prompt(harness_env):
 
     # 1. First send: Bootstrap State (session is new, not yet active in memory)
     m1, _ = await dispatcher.dispatch_user_message("c_proto", "First question")
-    assert kanaloa.last_sent_payload is not None
-    payload1 = kanaloa.last_sent_payload
+    await asyncio.sleep(0)
+    payload1 = {"method": kanaloa.sent_requests[-1][0], "params": kanaloa.sent_requests[-1][1]}
     assert payload1["method"] == "session/prompt"
     assert payload1["params"]["sessionId"] == "acp_sess_1"
     prompt_blocks1 = payload1["params"]["prompt"]
@@ -949,7 +1251,8 @@ async def test_kanaloa_adapter_incremental_vs_bootstrap_prompt(harness_env):
 
     # 2. Follow-up send on existing active session: Incremental State
     m2, _ = await dispatcher.dispatch_user_message("c_proto", "Follow-up question")
-    payload2 = kanaloa.last_sent_payload
+    await asyncio.sleep(0)
+    payload2 = {"method": kanaloa.sent_requests[-1][0], "params": kanaloa.sent_requests[-1][1]}
     assert payload2["method"] == "session/prompt"
     assert payload2["params"]["sessionId"] == "acp_sess_1"
     # No history repeated! Only the incremental new message block
@@ -966,7 +1269,8 @@ async def test_kanaloa_adapter_incremental_vs_bootstrap_prompt(harness_env):
 
     # 4. Next send triggers Session Rebuild State with visible history context blocks
     m3, _ = await dispatcher.dispatch_user_message("c_proto", "Question after restart")
-    payload3 = kanaloa.last_sent_payload
+    await asyncio.sleep(0)
+    payload3 = {"method": kanaloa.sent_requests[-1][0], "params": kanaloa.sent_requests[-1][1]}
     assert payload3["method"] == "session/prompt"
     prompt_blocks3 = payload3["params"]["prompt"]
     assert prompt_blocks3[-1]["text"] == "Question after restart"
@@ -1030,7 +1334,8 @@ async def test_session_rebuild_context_reconstruction_without_side_effect_replay
         current_input,
     )
 
-    payload = kanaloa.last_sent_payload
+    await asyncio.sleep(0)
+    payload = {"method": kanaloa.sent_requests[-1][0], "params": kanaloa.sent_requests[-1][1]}
     assert payload is not None
     assert payload["method"] == "session/prompt"
 
@@ -1079,9 +1384,10 @@ async def test_kanaloa_adapter_dispatcher_control_flows(harness_env):
     assert len(mock_kanaloa.cancel_notifs) == 1
     assert mock_kanaloa.cancel_notifs[0]["sessionId"] == "sess_wire_1"
 
-    # 2. Resume turn natively
+    # 2. Restore native context without claiming unfinished execution resumed.
     resumed = await dispatcher.resume_turn("t_ctrl")
-    assert resumed.status == "running"
+    assert resumed.status == "interrupted"
+    assert resumed.interrupt_reason == "session_rebound:unfinished_work_not_resumed"
     assert len(mock_kanaloa.resumed_sessions) == 1
     assert mock_kanaloa.resumed_sessions[0]["sessionId"] == "sess_wire_1"
 
@@ -1111,6 +1417,7 @@ async def test_kanaloa_native_steer_wire_protocol(harness_env):
     )
     store.save_turn(turn)
     mock_kanaloa.bind_session("t_steer", "sess_steer_wire")
+    store.append_message(Message(conversation_id="c_steer", turn_id="t_steer", sender="user", content="Initial prompt"))
 
     # 1. Dispatch user message while turn is actively running -> Dispatcher invokes native steer directly
     msg1, returned_turn = await dispatcher.dispatch_user_message(
@@ -1347,6 +1654,8 @@ async def test_kanaloa_approval_expired_and_unknown_requests(harness_env):
     kanaloa = MockWireKanaloaAdapter(event_handler=coord)
     mock_process = MagicMock()
     mock_process.stdin = AsyncMock()
+    mock_process.stdin.close = MagicMock(side_effect=lambda: setattr(mock_process, "returncode", 0))
+    mock_process.wait = AsyncMock(return_value=0)
     mock_process.returncode = None
     kanaloa._process = mock_process
     kanaloa._is_initialized = True
@@ -1482,9 +1791,12 @@ async def test_initialize_failure_cleans_up_and_allows_restart(harness_env, monk
 
     class FakeProc:
         def __init__(self):
-            self.stdin = AsyncMock()
-            self.stdout = AsyncMock()
-            self.stderr = AsyncMock()
+            self.stdin = MagicMock(drain=AsyncMock())
+            self.stdin.close.side_effect = lambda: setattr(self, "returncode", 0)
+            async def blocked_readline():
+                await asyncio.Future()
+            self.stdout = MagicMock(readline=blocked_readline)
+            self.stderr = MagicMock(readline=blocked_readline)
             self.returncode = None
             self.terminated = False
 
@@ -1626,4 +1938,3 @@ async def test_approval_resumes_via_emit_resumed_without_adapter_store_access(ha
 
     # Adapter itself must have NO store reference
     assert not hasattr(kanaloa, "store")
-

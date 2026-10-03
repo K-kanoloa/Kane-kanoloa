@@ -19,12 +19,12 @@ async function proxy(req: Request, { params }: { params: Promise<{ path: string[
   const token = req.headers.get("x-api-key") ?? process.env.OCTOPUS_API_TOKEN;
   if (authorization) headers.set("Authorization", authorization);
   if (token) headers.set("X-Api-Key", token);
-  if (req.method === "POST") headers.set("Content-Type", "application/json");
+    if (req.method === "POST" || req.method === "PUT" || req.method === "PATCH") headers.set("Content-Type", "application/json");
   try {
     const response = await fetch(`${getApiBaseUrl()}/${path.map(encodeURIComponent).join("/")}${incoming.search}`, {
       method: req.method,
       headers,
-      body: req.method === "POST" ? await req.text() : undefined,
+      body: ["POST", "PUT", "PATCH"].includes(req.method) ? await req.text() : undefined,
       cache: "no-store",
       signal: req.signal,
     });
@@ -39,3 +39,5 @@ async function proxy(req: Request, { params }: { params: Promise<{ path: string[
 
 export const GET = proxy;
 export const POST = proxy;
+export const PATCH = proxy;
+export const DELETE = proxy;

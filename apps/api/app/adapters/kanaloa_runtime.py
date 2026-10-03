@@ -1,182 +1,36 @@
-"""Kanaloa Agent Runtime.
-
-Owns agent runtime-level execution capabilities:
-1. Session-Scoped Persistent IPython (stateful variables, calculation, data manipulation).
-2. OS Shell Execution (PowerShell on Windows, Bash on Unix).
-3. Optional Loop Mode (governed strictly by single field max_iterations: int | None).
-"""
+"""Kanaloa private optional Loop execution. Native tools remain in DSH."""
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import logging
-import os
 import re
-import sys
-import types
-from typing import Any, Literal
-
-from IPython.core.interactiveshell import InteractiveShell
-from IPython.utils.io import capture_output
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class IPythonExecutionResult:
-    stdout: str
-    stderr: str
-    result: Any
-    success: bool
-    error: str | None = None
-
-
-class SessionIPythonRuntime:
-    """
-    Session-scoped persistent IPython execution environment.
-    Guarantees state persistence across multiple turns within the same session,
-    while maintaining strict variable and namespace isolation from other sessions.
-    """
-
-    _clean_base_ns: dict[str, Any] | None = None
-
-    def __init__(self, session_id: str) -> None:
-        self.session_id = session_id
-        # Obtain global InteractiveShell instance
-        self._shell = InteractiveShell.instance()
-
-        if SessionIPythonRuntime._clean_base_ns is None:
-            SessionIPythonRuntime._clean_base_ns = {
-                k: v for k, v in self._shell.user_ns.items()
-                if not k.startswith("_i") and k not in ("_", "__", "___", "_dh")
-            }
-
-        # Create isolated module for this session
-        mod_name = f"kanaloa_session_{session_id.replace('-', '_')}"
-        self.user_module = types.ModuleType(mod_name)
-        # Populate with standard base builtins and initial namespace
-        self.user_module.__dict__.update(dict(SessionIPythonRuntime._clean_base_ns))
-        self.user_module.__dict__["__name__"] = mod_name
-        self.user_module.__dict__["__session_id__"] = session_id
-        self.user_module.__dict__["In"] = [""]
-        self.user_module.__dict__["Out"] = {}
-        self.user_module.__dict__["_oh"] = self.user_module.__dict__["Out"]
-        self._is_active = True
-
-    def execute(self, code: str) -> IPythonExecutionResult:
-        """Execute Python code within this session's persistent namespace."""
-        if not self._is_active:
-            raise RuntimeError(f"IPython runtime for session '{self.session_id}' has been closed.")
-
-        # Activate this session's module and namespace in the shell
-        self._shell.user_module = self.user_module
-        self._shell.user_ns = self.user_module.__dict__
-
-        with capture_output() as cap:
-            run_res = self._shell.run_cell(code)
-
-        stdout = cap.stdout
-        stderr = cap.stderr
-        error_msg = None
-        if run_res.error_in_exec:
-            error_msg = str(run_res.error_in_exec)
-
-        return IPythonExecutionResult(
-            stdout=stdout,
-            stderr=stderr,
-            result=run_res.result,
-            success=run_res.success,
-            error=error_msg,
-        )
-
-    def get_variable(self, name: str) -> Any:
-        """Read a variable from this session's namespace."""
-        if not self._is_active:
-            raise RuntimeError(f"IPython runtime for session '{self.session_id}' has been closed.")
-        return self.user_module.__dict__.get(name)
-
-    def close(self) -> None:
-        """Release session namespace and clean up."""
-        self._is_active = False
-        # Clear user namespace dictionary to free memory and references
-        self.user_module.__dict__.clear()
-
-
-class SessionShellRuntime:
-    """
-    OS-Native Shell Execution:
-    - Windows: PowerShell (powershell.exe -NoProfile -NonInteractive -Command ...)
-    - Linux/macOS: Bash (/bin/bash -c ...)
-    """
-
-    @staticmethod
-    def get_shell_type() -> Literal["powershell", "bash"]:
-        return "powershell" if sys.platform == "win32" else "bash"
-
-    @classmethod
-    async def execute(
-        cls,
-        command: str,
-        cwd: str | None = None,
-        timeout: float = 60.0,
-    ) -> tuple[int, str, str]:
-        """Execute a shell command using the platform-native shell."""
-        if sys.platform == "win32":
-            shell_cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
-        else:
-            shell_cmd = ["/bin/bash", "-c", command]
-
-        proc = await asyncio.create_subprocess_exec(
-            *shell_cmd,
-            cwd=cwd or os.getcwd(),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            exit_code = proc.returncode or 0
-            stdout = stdout_b.decode("utf-8", errors="replace")
-            stderr = stderr_b.decode("utf-8", errors="replace")
-            return exit_code, stdout, stderr
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            return -1, "", f"Command timed out after {timeout} seconds"
+def normalize_acp_outcome(stop_reason: Any, native_kind: Any) -> tuple[str, str, str]:
+    stop = stop_reason if stop_reason in ("end_turn", "cancelled", "failed", "max_tokens") else "unknown"
+    native = native_kind if native_kind in ("completed", "blocked", "error", "aborted", "interrupted", "max-tokens") else "unknown"
+    if stop == "cancelled" or native in ("aborted", "interrupted"):
+        outcome = "cancelled"
+    elif native in ("blocked", "error") or stop == "failed":
+        outcome = "failed"
+    elif stop == "end_turn" and native == "completed":
+        outcome = "completed"
+    else:
+        outcome = "unknown"
+    return stop, native, outcome
 
 
 class KanaloaRuntime:
-    """
-    Kanaloa Agent Runtime Lifecycle Owner:
-    - Manages session-scoped persistent IPython runtimes.
-    - Manages OS-native shell calls (PowerShell on Windows, Bash on Unix).
-    - Owns optional Loop Mode execution & orchestration (iteration counting, COMPLETE determination, stop conditions).
-    """
+    """Owns only the optional Kanaloa Loop policy, not native tool execution."""
 
     def __init__(self) -> None:
-        self._ipython_sessions: dict[str, SessionIPythonRuntime] = {}
-        self.shell = SessionShellRuntime()
         self._active_loops: dict[str, dict[str, Any]] = {}
         self._iteration_outputs: dict[str, list[str]] = {}
 
-    def get_ipython(self, session_id: str) -> SessionIPythonRuntime:
-        """Get or create session-scoped persistent IPython runtime."""
-        if session_id not in self._ipython_sessions:
-            self._ipython_sessions[session_id] = SessionIPythonRuntime(session_id)
-        return self._ipython_sessions[session_id]
-
-    def close_ipython_session(self, session_id: str) -> None:
-        """Close and release IPython runtime for a closed session."""
-        session = self._ipython_sessions.pop(session_id, None)
-        if session:
-            session.close()
-
     def close_all(self) -> None:
-        """Release all active sessions and abort active loops on shutdown."""
-        for session in list(self._ipython_sessions.values()):
-            session.close()
-        self._ipython_sessions.clear()
         self.cancel_all_loops()
 
     # --- Loop Mode Management & Orchestration (Owned by KanaloaRuntime) ---
@@ -310,17 +164,27 @@ class KanaloaRuntime:
                 resp, stop_reason = await send_prompt_fn(session_id, current_prompt)
 
                 if "error" in resp:
-                    err_msg = resp["error"].get("message", "ACP prompt error in loop")
-                    await event_handler.emit_interrupted(turn_id, reason=f"acp_protocol:{err_msg}")
+                    error_code = resp["error"].get("code", "unknown")
+                    error_code = error_code if isinstance(error_code, int) else "unknown"
+                    await event_handler.emit_interrupted(turn_id, reason=f"acp_protocol:{error_code}")
                     return
 
                 # Check if cancelled mid-flight
-                if stop_reason == "cancelled" or loop_meta.get("cancelled"):
+                native_kind = resp.get("result", {}).get("_meta", {}).get("kaneNativeEndKind")
+                stop_reason, native_kind, outcome = normalize_acp_outcome(stop_reason, native_kind)
+                logger.info(
+                    "KanaloaRuntime: iteration outcome turn=%s session=%s stop=%s native=%s",
+                    turn_id, session_id, stop_reason, native_kind,
+                )
+                if outcome == "cancelled" or loop_meta.get("cancelled"):
                     await event_handler.emit_interrupted(turn_id, reason="cancelled_by_acp")
                     return
-                if stop_reason == "failed":
-                    await event_handler.emit_failed(
-                        turn_id, reason=str(resp.get("result", {}).get("failureReason") or "agent_reported_failure")
+                if outcome == "failed":
+                    await event_handler.emit_failed(turn_id, reason="agent_reported_failure")
+                    return
+                if outcome != "completed":
+                    await event_handler.emit_interrupted(
+                        turn_id, reason=f"acp_stop:{stop_reason or 'missing'}:native_{native_kind or 'missing'}"
                     )
                     return
 
@@ -372,9 +236,9 @@ class KanaloaRuntime:
                 sender_id="kanaloa",
             )
         except Exception as e:
-            logger.error("KanaloaRuntime: loop execution exception: %s", e)
+            logger.error("KanaloaRuntime: loop execution exception: %s", type(e).__name__)
             if not hasattr(event_handler, "is_turn_active") or event_handler.is_turn_active(turn_id):
-                await event_handler.emit_interrupted(turn_id, reason=f"acp_transport:{e}")
+                await event_handler.emit_interrupted(turn_id, reason=f"acp_transport:{type(e).__name__}")
         finally:
             self._active_loops.pop(turn_id, None)
             self._iteration_outputs.pop(turn_id, None)

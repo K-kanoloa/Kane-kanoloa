@@ -186,7 +186,7 @@ function Stop-KanePid {
     $childName = if ($child.Name) { $child.Name } else { "unknown" }
     Write-Host "[stop:stack] stopping descendant pid $childId ($childName)"
     try {
-      Stop-Process -Id $childId -ErrorAction Stop
+      Stop-Process -Id $childId -Force -ErrorAction Stop
     } catch {
       Write-Warning "[stop:stack] could not stop descendant pid ${childId}: $($_.Exception.Message)"
     }
@@ -195,7 +195,7 @@ function Stop-KanePid {
   $mode = if ($ManifestVerified) { "manifest" } else { "command-line verified" }
   Write-Host "[stop:stack] stopping port $Port pid $ProcessId ($name) [$mode]"
   try {
-    Stop-Process -Id $ProcessId -ErrorAction Stop
+    Stop-Process -Id $ProcessId -Force -ErrorAction Stop
   } catch {
     Write-Warning "[stop:stack] could not stop pid ${ProcessId}: $($_.Exception.Message)"
   }

@@ -62,3 +62,21 @@ tmp-smoke-output/
 /RUNTIME_HARDENING_PLAN.md
 scratch/
 
+# Release hygiene: runtime databases and private credential material at any path.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite3-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+.credentials.yaml
+.dsh/
+*.pem
+*.p12
+*.pfx
+

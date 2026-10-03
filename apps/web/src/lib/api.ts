@@ -3,7 +3,8 @@ export type TurnStatus = "running" | "waiting_user" | "finished" | "failed" | "i
 export type Conversation = { conversation_id: string; title: string; bound_agent_id: string; focus_turn_id: string | null; created_at: string; updated_at: string };
 export type Message = { message_id: string; conversation_id: string; turn_id: string | null; sender: "user" | "agent" | "system"; sender_id: string | null; reply_to: string | null; parent_id: string | null; content: string; kind: "normal" | "edit" | "retract"; target_message_id: string | null; created_at: string };
 export type Turn = { turn_id: string; conversation_id: string; bound_agent_id: string; branch_id: string; title: string | null; status: TurnStatus; native_session_ref: string | null; last_event_at: string; interrupt_reason: string | null; partial_output: string | null; created_at: string; finished_at: string | null };
-export type Agent = { agent_id: string; status: string; supports_stream: boolean; supports_resume: boolean; supports_cancel: boolean; supports_approval: boolean; supports_parallel_sessions: boolean; max_parallel_sessions: number | null; branch_mode: "native" | "replay" | "unsupported"; steer_mode: "native" | "safe_boundary" | "follow_up_only" };
+export type Agent = { agent_id: string; display_name?: string | null; status: string; supports_stream: boolean; supports_resume: boolean; supports_cancel: boolean; supports_approval: boolean; supports_parallel_sessions: boolean; max_parallel_sessions: number | null; branch_mode: "native" | "replay" | "unsupported"; steer_mode: "native" | "safe_boundary" | "follow_up_only"; auto_start: boolean | null };
+export type AgentPairing = { agent_id: string; pairing_code: string; expires_in_seconds: number | null };
 export type Permission = { request_id: string; title: string; created_at: number };
 export type Activity = { event_id: string; event_type: string; created_at: string; payload: Record<string, string> };
 export type TurnDetail = Turn & { pending_permissions: Permission[]; loop: { current_iteration: number; max_iterations: number | null; stop_requested: boolean } | null; events: Activity[] };
@@ -27,21 +28,31 @@ async function responseError(response: Response): Promise<ApiRequestError> {
 const url = (path: string) => `/api/proxy/api/v1${path}`;
 const id = encodeURIComponent;
 
-async function request<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+async function request<T>(path: string, body?: unknown, signal?: AbortSignal, method?: string): Promise<T> {
   const response = await fetch(url(path), {
-    method: body === undefined ? "GET" : "POST",
+    method: method ?? (body === undefined ? "GET" : "POST"),
     headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
     cache: "no-store",
     signal: signal ?? AbortSignal.timeout(30000),
   });
   if (!response.ok) throw await responseError(response);
-  return response.json() as Promise<T>;
+  return response.status === 204 ? undefined as T : response.json() as Promise<T>;
 }
 
 export const api = {
   agents: (signal?: AbortSignal) => request<Agent[]>("/agents", undefined, signal),
+  renameAgent: (aid: string, display_name: string) => request<{ agent_id: string; display_name: string }>(`/agents/${id(aid)}`, { display_name }, undefined, "PATCH"),
+  disconnectAgent: (aid: string) => request<void>(`/agents/${id(aid)}/disconnect`, {}, undefined),
+  deleteAgent: (aid: string) => request<void>(`/agents/${id(aid)}`, undefined, undefined, "DELETE"),
+  createAgentPairing: (agent_id: string, display_name: string) => request<AgentPairing>("/agents/pairings", { agent_id, display_name }),
+  activateKanaloa: () => request<Agent>("/agents/kanaloa/activate", {}, AbortSignal.timeout(45000)),
+  deactivateKanaloa: () => request<void>("/agents/kanaloa/deactivate", {}),
+  setKanaloaAutoStart: (auto_start: boolean) => request<Agent>("/agents/kanaloa/preferences", { auto_start }),
+  saveKanaloaModelConfig: (config: { base_url: string; model: string; api_key: string }) => request<{ status: string; provider: string; model: string }>("/agents/kanaloa/model-config", config),
   conversations: (signal?: AbortSignal) => request<Conversation[]>("/conversations", undefined, signal),
+  renameConversation: (cid: string, title: string) => request<Conversation>(`/conversations/${id(cid)}`, { title }, undefined, "PATCH"),
+  deleteConversation: (cid: string) => request<void>(`/conversations/${id(cid)}`, undefined, undefined, "DELETE"),
   conversation: (cid: string, signal?: AbortSignal) => request<Conversation>(`/conversations/${id(cid)}`, undefined, signal),
   createConversation: (title: string, agent: string) => request<Conversation>("/conversations", { title, bound_agent_id: agent }),
   turns: (cid: string, signal?: AbortSignal) => request<Turn[]>(`/conversations/${id(cid)}/turns`, undefined, signal),

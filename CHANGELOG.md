@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.1.0-beta - 2026-10-03
+
+New Kane-Kanaloa vNext evaluation baseline. Known and unknown bugs may exist;
+this is not a production-readiness claim. v0.1 identifies the new thin Harness
+product; historical v2 tags are preserved.
+
+- Thin model-free Conversation/Message/Turn/Branch Harness and SQLite Store.
+- Explicit completion, SSE, partial output and runtime-truth recovery.
+- Bundled Kanaloa/modified DSH Harness, Normal/Loop modes and user model configuration.
+- Unified external Connector path, Codex reference, Skill/MCP and shared conformance.
+- Current human control UI for conversations, Agent connections and runtime facts.
+- Release README/notes and upstream third-party license attribution updated.
+- Quick typecheck and smoke passed; full suites were not rerun for this release.
+- Existing data, configuration, historical commits and tags retained.
+
+## Historical v2 Reference
+
 ## v2.0.0 - Public Release Readiness
 
 Kane Agent Platform v2.0.0 establishes the Agent OS foundation for local-first agent execution.

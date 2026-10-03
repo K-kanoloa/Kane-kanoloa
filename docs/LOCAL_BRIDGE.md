@@ -1,5 +1,9 @@
 # Local Bridge
 
+> This document covers the frozen v2.0.0 task-execution Bridge. It is not the
+> vNext external Agent connection path. vNext Connectors use
+> `KANE_CONNECTOR_PROTOCOL.md` and initiate an outbound connection to Kane.
+
 The Local Bridge is a small FastAPI service that runs on the user's machine or trusted local network. Kane API uses it for local agent adapters and handoff flows.
 
 Default URL:

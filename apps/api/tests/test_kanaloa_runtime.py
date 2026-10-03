@@ -1,27 +1,4 @@
-"""Kane vNext: Comprehensive Kanaloa Agent Runtime Unit Tests.
-
-Covers:
-1. Session-Scoped Persistent IPython:
-   - Same-session persistence across turns (variables, functions, mutables).
-   - Cross-session isolation (zero crosstalk, NameError on other session globals).
-   - Session close and cleanup (namespace purged, no orphan processes).
-2. Shell Runtime:
-   - Platform-native detection (PowerShell on Windows, Bash on Unix).
-   - Command execution and result capture.
-3. Approval Disconnect Fail-Closed:
-   - Subprocess disconnect / session close immediately invalidates live permissions.
-   - Waiting_user turn transitions to interrupted.
-   - Zero state restoration across process restart.
-4. Optional Loop Mode:
-   - Governed strictly by single field max_iterations: int | None.
-   - Normal Mode: default execution without loop wrapper.
-   - Default: max_iterations = 5.
-   - Unlimited: max_iterations = None.
-   - Custom: max_iterations = 3 and max_iterations = 10.
-   - Early COMPLETE: halts iteration early upon COMPLETE token.
-   - Invalid max_iterations: fail-closed rejection.
-   - Steer, Approval, and Cancel during Loop.
-"""
+"""Kanaloa approval, completion and optional Loop regression tests."""
 
 from __future__ import annotations
 
@@ -33,12 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.adapters.kanaloa_adapter import KanaloaAdapter, _UNSET
-from app.adapters.kanaloa_runtime import (
-    IPythonExecutionResult,
-    KanaloaRuntime,
-    SessionIPythonRuntime,
-    SessionShellRuntime,
-)
+from app.adapters.kanaloa_runtime import KanaloaRuntime
 from app.domain.models import Conversation, Message, Turn
 from app.harness.coordinator import HarnessCoordinator
 from app.harness.dispatcher import Dispatcher
@@ -94,112 +66,10 @@ class LoopMockWireKanaloaAdapter(KanaloaAdapter):
                 if callable(resp):
                     return await resp(params)
                 return resp
-            return {"result": {"stopReason": "endTurn"}}
+            return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
         if method == "session/close":
             return {"result": {}}
         return {"result": {}}
-
-
-# ==============================================================================
-# 1. Session-Scoped Persistent IPython Tests
-# ==============================================================================
-
-def test_ipython_same_session_persistence():
-    """Verify variables and function definitions persist across turns in the same session."""
-    runtime = KanaloaRuntime()
-    s = runtime.get_ipython("sess_turn_test")
-
-    # Turn 1: define variables and function
-    r1 = s.execute("x = 42\ndef compute(factor):\n    return x * factor")
-    assert r1.success, f"Turn 1 execution failed: {r1.error}"
-
-    # Turn 2: invoke function and mutate variable
-    r2 = s.execute("y = compute(2)")
-    assert r2.success, f"Turn 2 execution failed: {r2.error}"
-    assert s.get_variable("y") == 84
-
-    # Turn 3: check persistence
-    r3 = s.execute("y + x")
-    assert r3.success
-    assert r3.result == 126
-
-    runtime.close_all()
-
-
-def test_ipython_cross_session_isolation():
-    """Verify strict variable and namespace isolation between different sessions."""
-    runtime = KanaloaRuntime()
-    s_alpha = runtime.get_ipython("sess_alpha")
-    s_beta = runtime.get_ipython("sess_beta")
-
-    # Session Alpha defines secret
-    r_alpha = s_alpha.execute("secret_token = 'ALPHA_SECRET_123'")
-    assert r_alpha.success
-    assert s_alpha.get_variable("secret_token") == "ALPHA_SECRET_123"
-
-    # Session Beta attempts to access Alpha's secret -> must fail with NameError
-    r_beta = s_beta.execute("secret_token")
-    assert not r_beta.success
-    assert "name 'secret_token' is not defined" in str(r_beta.error)
-    assert s_beta.get_variable("secret_token") is None
-
-    runtime.close_all()
-
-
-def test_ipython_complex_mutable_objects():
-    """Verify complex objects, dictionaries, lists, and imports mutate properly across turns."""
-    runtime = KanaloaRuntime()
-    s = runtime.get_ipython("sess_complex")
-
-    # Turn 1: import module and create nested dict
-    r1 = s.execute("import math\nstate = {'pi': math.pi, 'history': [10, 20]}")
-    assert r1.success
-
-    # Turn 2: mutate list
-    r2 = s.execute("state['history'].append(30)")
-    assert r2.success
-
-    # Turn 3: inspect
-    r3 = s.execute("sum(state['history'])")
-    assert r3.result == 60
-
-    runtime.close_all()
-
-
-def test_ipython_session_close_cleanup():
-    """Verify closing a session purges its namespace and blocks further execution."""
-    runtime = KanaloaRuntime()
-    s = runtime.get_ipython("sess_cleanup")
-
-    s.execute("val = 999")
-    assert s.get_variable("val") == 999
-
-    runtime.close_ipython_session("sess_cleanup")
-
-    # Further execution raises RuntimeError
-    with pytest.raises(RuntimeError, match="has been closed"):
-        s.execute("val + 1")
-
-    # Reading variable on closed session raises RuntimeError
-    with pytest.raises(RuntimeError, match="has been closed"):
-        s.get_variable("val")
-
-
-# ==============================================================================
-# 2. Shell Runtime Tests
-# ==============================================================================
-
-@pytest.mark.asyncio
-async def test_shell_platform_execution():
-    """Verify platform-native shell command execution."""
-    runtime = KanaloaRuntime()
-    shell_type = runtime.shell.get_shell_type()
-    assert shell_type in ("powershell", "bash")
-
-    cmd = "Write-Output 'SHELL_OK'" if shell_type == "powershell" else "echo 'SHELL_OK'"
-    code, stdout, stderr = await runtime.shell.execute(cmd)
-    assert code == 0, f"Shell error: {stderr}"
-    assert "SHELL_OK" in stdout
 
 
 # ==============================================================================
@@ -342,13 +212,13 @@ async def test_loop_mode_early_complete(harness_env):
         # Emit delta containing COMPLETE
         await kanaloa.event_handler.emit_delta("t_early", "Task is finished. COMPLETE!")
         kanaloa.runtime.record_delta("t_early", "Task is finished. COMPLETE!")
-        return {"result": {"stopReason": "endTurn"}}
+        return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
 
     kanaloa = LoopMockWireKanaloaAdapter(
         prompt_responses=[
-            {"result": {"stopReason": "endTurn"}},  # iteration 1
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 1
             mock_iter2_resp,                         # iteration 2 -> COMPLETE
-            {"result": {"stopReason": "endTurn"}},  # iteration 3 (should not run)
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 3 (should not run)
         ],
         event_handler=coord,
     )
@@ -406,7 +276,7 @@ async def test_loop_mode_unlimited_stops_on_complete(harness_env):
         if kanaloa._prompt_call_count == 7:
             await kanaloa.event_handler.emit_delta("t_unl", "All 7 steps done. COMPLETE.")
             kanaloa.runtime.record_delta("t_unl", "All 7 steps done. COMPLETE.")
-        return {"result": {"stopReason": "endTurn"}}
+        return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
 
     kanaloa = LoopMockWireKanaloaAdapter(
         prompt_responses=[mock_iter_resp] * 10,
@@ -515,9 +385,9 @@ async def test_loop_mode_cancel_during_loop(harness_env):
 
     kanaloa = LoopMockWireKanaloaAdapter(
         prompt_responses=[
-            {"result": {"stopReason": "endTurn"}},  # iter 1
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iter 1
             cancel_on_iter2,                         # iter 2 cancels
-            {"result": {"stopReason": "endTurn"}},  # iter 3 should never run
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iter 3 should never run
         ],
         event_handler=coord,
     )
@@ -585,12 +455,12 @@ async def test_loop_mode_stop_does_not_start_next_iteration(harness_env):
     async def mock_iter1_with_stop(params):
         turn_obj = store.get_turn("t_lstop")
         kanaloa.stop_loop(turn_obj)
-        return {"result": {"stopReason": "endTurn"}}
+        return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
 
     kanaloa = LoopMockWireKanaloaAdapter(
         prompt_responses=[
             mock_iter1_with_stop,
-            {"result": {"stopReason": "endTurn"}},  # iteration 2 must NOT run
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 2 must NOT run
         ],
         event_handler=coord,
     )
@@ -621,8 +491,8 @@ async def test_loop_mode_failed_halts_loop_immediately(harness_env):
 
     kanaloa = LoopMockWireKanaloaAdapter(
         prompt_responses=[
-            {"result": {"stopReason": "failed", "failureReason": "Agent work failed"}},
-            {"result": {"stopReason": "endTurn"}},  # iteration 2 must NOT run
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "error"}}},
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 2 must NOT run
         ],
         event_handler=coord,
     )
@@ -664,7 +534,106 @@ async def test_stdio_failure_is_interrupted_not_failed(harness_env, loop_mode):
     persisted = store.get_turn(turn.turn_id)
     assert persisted.status == "interrupted"
     assert persisted.partial_output == "Partial answer"
-    assert "stdio disconnected" in persisted.interrupt_reason
+    assert "BrokenPipeError" in persisted.interrupt_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loop_mode", [False, True])
+@pytest.mark.parametrize("stop_reason", [None, "end_turn", "max_tokens", "unexpected"])
+async def test_nonterminal_acp_stop_never_finalizes_message(harness_env, loop_mode, stop_reason):
+    store, _, coord, _ = harness_env
+    adapter = LoopMockWireKanaloaAdapter(
+        prompt_responses=[{"result": {"stopReason": stop_reason}}],
+        event_handler=coord,
+    )
+    conv = Conversation(conversation_id="c_stop", bound_agent_id="kanaloa")
+    turn = Turn(
+        turn_id="t_stop", conversation_id=conv.conversation_id,
+        bound_agent_id="kanaloa", partial_output="Partial answer",
+    )
+    store.save_conversation(conv)
+    store.save_turn(turn)
+    message = Message(conversation_id=conv.conversation_id, sender="user", content="Work")
+    if loop_mode:
+        await adapter.send(turn, message, [], max_iterations=5)
+    else:
+        await adapter.send(turn, message, [])
+    await asyncio.sleep(0.05)
+
+    persisted = store.get_turn(turn.turn_id)
+    assert persisted.status == "interrupted"
+    assert persisted.partial_output == "Partial answer"
+    assert store.get_messages(conv.conversation_id) == []
+    assert adapter._prompt_call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loop_mode", [False, True])
+@pytest.mark.parametrize(
+    ("native_kind", "expected_status"),
+    [
+        ("completed", "finished"),
+        ("blocked", "failed"),
+        ("error", "failed"),
+        ("aborted", "interrupted"),
+        ("interrupted", "interrupted"),
+    ],
+)
+async def test_native_dsh_outcome_survives_acp_end_turn(harness_env, loop_mode, native_kind, expected_status):
+    store, _, coord, _ = harness_env
+    adapter = LoopMockWireKanaloaAdapter(
+        prompt_responses=[{"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": native_kind}}}],
+        event_handler=coord,
+    )
+    conv = Conversation(conversation_id="c_native", bound_agent_id="kanaloa")
+    turn = Turn(
+        turn_id="t_native", conversation_id=conv.conversation_id,
+        bound_agent_id="kanaloa", partial_output="Partial answer",
+    )
+    store.save_conversation(conv)
+    store.save_turn(turn)
+    message = Message(conversation_id=conv.conversation_id, sender="user", content="Work")
+    if loop_mode:
+        await adapter.send(turn, message, [], max_iterations=1)
+    else:
+        await adapter.send(turn, message, [])
+    await asyncio.sleep(0.05)
+
+    persisted = store.get_turn(turn.turn_id)
+    assert persisted.status == expected_status
+    assert adapter._prompt_call_count == 1
+    messages = store.get_messages(conv.conversation_id)
+    assert len(messages) == (1 if expected_status == "finished" else 0)
+    if expected_status != "finished":
+        assert persisted.partial_output == "Partial answer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loop_mode", [False, True])
+async def test_acp_error_does_not_persist_raw_message(harness_env, loop_mode, caplog):
+    store, _, coord, _ = harness_env
+    secret = "KANALOA_TEST_SECRET_DO_NOT_RECORD"
+    adapter = LoopMockWireKanaloaAdapter(
+        prompt_responses=[{"error": {"code": -32603, "message": secret}}],
+        event_handler=coord,
+    )
+    conv = Conversation(conversation_id="c_error", bound_agent_id="kanaloa")
+    turn = Turn(turn_id="t_error", conversation_id=conv.conversation_id, bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    store.save_turn(turn)
+    message = Message(conversation_id=conv.conversation_id, sender="user", content="Work")
+
+    if loop_mode:
+        await adapter.send(turn, message, [], max_iterations=5)
+    else:
+        await adapter.send(turn, message, [])
+    await asyncio.sleep(0.05)
+
+    persisted = store.get_turn(turn.turn_id)
+    assert persisted.status == "interrupted"
+    assert persisted.interrupt_reason == "acp_protocol:-32603"
+    assert secret not in caplog.text
+    assert secret not in str(store.list_events(turn.turn_id))
 
 
 @pytest.mark.asyncio
@@ -694,12 +663,12 @@ async def test_loop_mode_interrupted_halts_loop_immediately(harness_env):
     async def mock_iter1_external_interrupt(params):
         # Simulate external interruption entering store
         await coord.emit_interrupted("t_linter", reason="external_worker_eviction")
-        return {"result": {"stopReason": "endTurn"}}
+        return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
 
     kanaloa = LoopMockWireKanaloaAdapter(
         prompt_responses=[
             mock_iter1_external_interrupt,
-            {"result": {"stopReason": "endTurn"}},  # iteration 2 must NOT run
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 2 must NOT run
         ],
         event_handler=coord,
     )
@@ -749,12 +718,12 @@ async def test_loop_mode_approval_does_not_increment_iteration(harness_env):
         # Emit [COMPLETE] delta within same iteration
         await kanaloa.event_handler.emit_delta("t_lappr_cnt", "Execution finished after approval. [COMPLETE]")
         kanaloa.runtime.record_delta("t_lappr_cnt", "Execution finished after approval. [COMPLETE]")
-        return {"result": {"stopReason": "endTurn"}}
+        return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
 
     kanaloa = LoopMockWireKanaloaAdapter(
         prompt_responses=[
             mock_iter1_with_approval,
-            {"result": {"stopReason": "endTurn"}},  # iteration 2 must NOT run
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 2 must NOT run
         ],
         event_handler=coord,
     )
@@ -804,13 +773,13 @@ async def test_loop_mode_steer_does_not_increment_iteration(harness_env):
         # Complete iteration 2
         await kanaloa.event_handler.emit_delta("t_lsteer_cnt", "Adjusted and finished. [COMPLETE]")
         kanaloa.runtime.record_delta("t_lsteer_cnt", "Adjusted and finished. [COMPLETE]")
-        return {"result": {"stopReason": "endTurn"}}
+        return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
 
     kanaloa = LoopMockWireKanaloaAdapter(
         prompt_responses=[
-            {"result": {"stopReason": "endTurn"}},  # iteration 1
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 1
             mock_iter2_with_steer,                   # iteration 2 with steer + COMPLETE
-            {"result": {"stopReason": "endTurn"}},  # iteration 3 must NOT run
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 3 must NOT run
         ],
         event_handler=coord,
     )

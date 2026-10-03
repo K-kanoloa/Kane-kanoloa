@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
 
@@ -37,28 +37,19 @@ const services = [
     ],
   },
   {
-    name: "bridge",
-    port: 8010,
-    command: process.execPath,
-    args: [
-      "scripts/run-python.mjs",
-      "apps/local-bridge",
-      "-m",
-      "uvicorn",
-      "app.main:app",
-      "--host",
-      "127.0.0.1",
-      "--port",
-      "8010",
-    ],
-  },
-  {
     name: "web",
     port: 3000,
     command: npmCommand,
     args: [...npmArgsPrefix, "--workspace", "@kane/web", "run", "dev"],
   },
 ];
+
+if (process.argv.includes("--with-bridge")) {
+  services.push({
+    name: "bridge", port: 8010, command: process.execPath,
+    args: ["scripts/run-python.mjs", "apps/local-bridge", "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8010"],
+  });
+}
 
 mkdirSync(runtimeDir, { recursive: true });
 
@@ -90,8 +81,12 @@ function writeManifest() {
 function stopChildren() {
   shuttingDown = true;
   for (const { child } of [...children].reverse()) {
-    if (!child.killed) {
-      child.kill();
+    if (child.exitCode === null && child.signalCode === null) {
+      if (process.platform === "win32") {
+        spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+      } else {
+        child.kill();
+      }
     }
   }
 }
@@ -114,6 +109,11 @@ for (const service of services) {
     );
     stopChildren();
     process.exitCode = code ?? 1;
+  });
+  child.on("error", (error) => {
+    console.error(`[dev:stack] ${service.name} could not start: ${error.code ?? "spawn_failed"}`);
+    stopChildren();
+    process.exitCode = 1;
   });
 }
 

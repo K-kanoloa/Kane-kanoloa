@@ -3,9 +3,11 @@
  * scripts/patch-dsh-acp.mjs
  * 
  * Formal, reproducible build/setup script for Kanaloa's downstream DSH Steer Extension.
- * Applies the verified Native Steer extension to project-local @deepseek-ai/dsh-acp:
+ * Applies Kanaloa's verified extensions to project-local @deepseek-ai/dsh-acp:
  * 1. AcpSession.prototype.steer(params) -> native agent.steer(message)
  * 2. connection.onRequest("session/steer", ...) and onNotification("session/steer", ...)
+ * 3. Preserve the native turn/end kind in ACP PromptResponse._meta.
+ * 4. Use the saved Runtime default model for new ACP sessions.
  * 
  * Strict Fail-Closed Design:
  * - Targets ONLY project-local node_modules/@deepseek-ai/dsh-acp
@@ -97,13 +99,8 @@ function verifyAndPatchProjectDshAcp() {
   const hasImplSteer = content.includes('return requireSession(brandString(params.sessionId)).steer(params);');
   const hasConnSteer = content.includes('.onRequest("session/steer"');
 
-  if (hasSteerMethod && hasImplSteer && hasConnSteer) {
-    console.log(`[patch-dsh-acp] Verified intact: @deepseek-ai/dsh-acp@${EXPECTED_VERSION} at ${indexPath} is already patched.`);
-    return false;
-  }
-
-  // If partially patched or in an unexpected state, fail closed
-  if (hasSteerMethod || hasImplSteer || hasConnSteer) {
+  const steerInstalled = hasSteerMethod && hasImplSteer && hasConnSteer;
+  if (!steerInstalled && (hasSteerMethod || hasImplSteer || hasConnSteer)) {
     throw new Error(
       `[patch-dsh-acp] FATAL: Inconsistent/partial steer patch detected in "${indexPath}". Aborting fail-closed.`
     );
@@ -123,31 +120,73 @@ function verifyAndPatchProjectDshAcp() {
 
   const connTarget = `.onRequest(methods.agent.session.prompt, ({ params, signal }) => implementation.prompt(params, signal))`;
 
-  const cancelCount = countOccurrences(content, cancelTarget);
-  if (cancelCount !== 1) {
-    throw new Error(
-      `[patch-dsh-acp] FATAL: Expected exactly 1 occurrence of cancel() anchor, found ${cancelCount}. Upstream code shape mismatch; aborting fail-closed.`
-    );
+  let changed = false;
+  if (!steerInstalled) {
+    for (const [anchor, label] of [[cancelTarget, 'cancel()'], [promptTarget, 'implementation.prompt()'], [connTarget, 'connection.onRequest(prompt)']]) {
+      if (countOccurrences(content, anchor) !== 1) {
+        throw new Error(`[patch-dsh-acp] FATAL: Expected exactly 1 ${label} anchor; aborting fail-closed.`);
+      }
+    }
+    content = content.replace(cancelTarget, `${cancelTarget}\n${STEER_METHOD_CODE}`);
+    content = content.replace(promptTarget, `${promptTarget}\n${IMPLEMENTATION_STEER_CODE}`);
+    content = content.replace(connTarget, `${connTarget}${CONNECTION_STEER_CODE}`);
+    changed = true;
   }
 
-  const promptCount = countOccurrences(content, promptTarget);
-  if (promptCount !== 1) {
-    throw new Error(
-      `[patch-dsh-acp] FATAL: Expected exactly 1 occurrence of implementation.prompt() anchor, found ${promptCount}. Upstream code shape mismatch; aborting fail-closed.`
-    );
+  // ACP's deployment defaults otherwise override the user's saved model route.
+  const services = 'const inject = [\n\t"agents",';
+  const oldSavedServices = 'const inject = [\n\t"agentDefaultModel",\n\t"agents",';
+  const savedServices = 'const inject = [\n\t"settings",\n\t"credentials",\n\t"agentDefaultModel",\n\t"agents",';
+  if (countOccurrences(content, oldSavedServices) === 1) content = content.replace(oldSavedServices, services);
+  const routeAnchors = [
+    ['agentOptions: agentOptions(config),', 'agentOptions: ctx.agentDefaultModel.currentSelection(),', 2],
+    ['fallbackSelection: initialSelection(config),', 'fallbackSelection: ctx.agentDefaultModel.currentSelection(),', 2],
+    [services, savedServices, 1],
+  ];
+  for (const [before, after, expected] of routeAnchors) {
+    if (countOccurrences(content, after) === expected && countOccurrences(content, before) === 0) continue;
+    if (countOccurrences(content, before) !== expected || countOccurrences(content, after) !== 0) {
+      throw new Error('[patch-dsh-acp] FATAL: Saved-model routing anchors changed; aborting fail-closed.');
+    }
+    content = content.replaceAll(before, after);
+    changed = true;
+  }
+  const newSessionAnchor = '\t\tasync newSession(params, signal) {\n\t\t\tassertOpen();\n\t\t\tvalidateWorkspaceParams(params);';
+  const configuredSession = `${newSessionAnchor}\n\t\t\tconst savedModel = ctx.settings.describe().find((section) => section.ns === "agent-default-model")?.user;\n\t\t\tif (!savedModel?.provider || !savedModel?.model) throw invalidParams("Kanaloa model is not configured; save Base URL, Model and API Key in Kane first.");`;
+  if (countOccurrences(content, configuredSession) !== 1) {
+    if (countOccurrences(content, newSessionAnchor) !== 1) throw new Error('[patch-dsh-acp] FATAL: Model configuration guard anchor changed.');
+    content = content.replace(newSessionAnchor, configuredSession);
+    changed = true;
   }
 
-  const connCount = countOccurrences(content, connTarget);
-  if (connCount !== 1) {
-    throw new Error(
-      `[patch-dsh-acp] FATAL: Expected exactly 1 occurrence of connection.onRequest(prompt) anchor, found ${connCount}. Upstream code shape mismatch; aborting fail-closed.`
-    );
+  const nativeResult = 'return { stopReason: await completion.promise, _meta: { kaneNativeEndKind: inflight.endReason?.kind ?? "unknown", ...(inflight.endReason?.kind === "error" ? { kaneNativeErrorCode: typeof inflight.endReason.error?.code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(inflight.endReason.error.code) ? inflight.endReason.error.code : void 0, kaneNativeErrorStatus: Number.isInteger(inflight.endReason.error?.status) && inflight.endReason.error.status >= 100 && inflight.endReason.error.status <= 599 ? inflight.endReason.error.status : void 0, kaneNativeErrorSource: typeof inflight.endReason.error?.source === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(inflight.endReason.error.source) ? inflight.endReason.error.source : void 0 } : {}) } };';
+  const legacyNativeResult = 'return { stopReason: await completion.promise, _meta: { kaneNativeEndKind: inflight.endReason?.kind ?? "unknown" } };';
+  const upstreamResult = 'return { stopReason: await completion.promise };';
+  const upstreamError = 'else if (end.kind === "error") inflight.reject(internalError$1(`turn failed: ${end.error.message}`));';
+  const nativeError = 'else if (end.kind === "error") inflight.resolve(turnEndToStopReason(end));';
+  const resultInstalled = countOccurrences(content, nativeResult);
+  const legacyResultInstalled = countOccurrences(content, legacyNativeResult);
+  const errorInstalled = countOccurrences(content, nativeError);
+  if (resultInstalled === 2 && errorInstalled === 1) {
+    // Already installed, including when postinstall runs after setup:dsh.
+  } else if (resultInstalled === 0 && legacyResultInstalled === 2 && errorInstalled === 1) {
+    content = content.replaceAll(legacyNativeResult, nativeResult);
+    changed = true;
+  } else if (resultInstalled !== 0 || errorInstalled !== 0) {
+    throw new Error('[patch-dsh-acp] FATAL: Partial native-outcome patch detected; aborting fail-closed.');
+  } else {
+    if (countOccurrences(content, upstreamResult) !== 2 || countOccurrences(content, upstreamError) !== 1) {
+      throw new Error('[patch-dsh-acp] FATAL: Native-outcome anchors changed; aborting fail-closed.');
+    }
+    content = content.replaceAll(upstreamResult, nativeResult);
+    content = content.replace(upstreamError, nativeError);
+    changed = true;
   }
 
-  // 4. Apply patch
-  content = content.replace(cancelTarget, `${cancelTarget}\n${STEER_METHOD_CODE}`);
-  content = content.replace(promptTarget, `${promptTarget}\n${IMPLEMENTATION_STEER_CODE}`);
-  content = content.replace(connTarget, `${connTarget}${CONNECTION_STEER_CODE}`);
+  if (!changed) {
+    console.log(`[patch-dsh-acp] Verified intact: @deepseek-ai/dsh-acp@${EXPECTED_VERSION} at ${indexPath} is already patched.`);
+    return false;
+  }
 
   fs.writeFileSync(indexPath, content, 'utf8');
 

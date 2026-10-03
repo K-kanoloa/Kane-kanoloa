@@ -9,7 +9,7 @@ export function IconButton({ label, children, ...props }: ButtonHTMLAttributes<H
 }
 
 export function BrandMark({ small = false }: { small?: boolean }) {
-  return <span className={`brand-mark ${small ? "small" : ""}`} role="img" aria-label="Kane">🐙</span>;
+  return <span className={`brand-mark ${small ? "small" : ""}`}><img src="/kane-octopus.png" alt="Kane" width={40} height={40} /></span>;
 }
 
 export function Status({ status }: { status: TurnStatus }) {

@@ -15,12 +15,13 @@ def test_api_imports_and_creates_app():
     assert app.version == "2.0.0"
 
 
-def test_default_lifespan_starts_without_adapter_injection():
+def test_default_lifespan_starts_without_vendor_specific_external_adapters():
     fresh_app = create_app()
     fresh_app.state.store = SQLiteStore(":memory:")
     with TestClient(fresh_app) as client:
         assert client.get("/health").status_code == 200
         assert fresh_app.state.coordinator.has_adapter("kanaloa")
+        assert set(fresh_app.state.coordinator._adapters) == {"kanaloa"}
         assert fresh_app.state.kanaloa_adapter.runtime is fresh_app.state.kanaloa_runtime
 
 

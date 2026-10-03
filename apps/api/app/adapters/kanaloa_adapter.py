@@ -37,13 +37,14 @@ from dataclasses import dataclass
 import json
 import logging
 import os
-import sys
+import re
+import shutil
 import time
 from typing import Any, Literal
 
 from ..domain.models import AgentCapabilities, Message, Turn, current_iso
 from .base import AgentEventHandler, BaseAdapter
-from .kanaloa_runtime import KanaloaRuntime
+from .kanaloa_runtime import KanaloaRuntime, normalize_acp_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +79,12 @@ class KanaloaAdapter(BaseAdapter):
         super().__init__(event_handler)
         self.cwd = cwd or os.getcwd()
 
+        self._default_command = command is None
+        self._bundled_dsh: str | None = None
         if command:
             self.command = command
         else:
-            # Deterministic downstream resolution: prefer project-local DSH if present, fallback to npx
+            # The pinned DSH package is bundled by npm install; never fetch a runtime on first send.
             local_dsh = os.path.join(self.cwd, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")
             if not os.path.exists(local_dsh):
                 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
@@ -90,10 +93,14 @@ class KanaloaAdapter(BaseAdapter):
                     local_dsh = candidate
 
             if os.path.exists(local_dsh):
+                self._bundled_dsh = local_dsh
                 self.command = ["node", local_dsh, "--profile", "acp"]
             else:
-                default_npx = "npx.cmd" if sys.platform == "win32" else "npx"
-                self.command = [default_npx, "--yes", "@deepseek-ai/dsh", "--profile", "acp"]
+                self.command = ["node", local_dsh, "--profile", "acp"]
+
+        if self._default_command:
+            persona = os.path.join(os.path.dirname(__file__), "kanaloa-persona.patch.yml")
+            self.command.extend(["--patch", persona])
 
         self._process: asyncio.subprocess.Process | None = None
         self._turn_sessions: dict[str, str] = {}  # turn_id -> native_sessionId
@@ -107,9 +114,9 @@ class KanaloaAdapter(BaseAdapter):
         self._lock = asyncio.Lock()
         self._pending_permissions: dict[str, PendingPermissionRequest] = {}
         self.runtime = runtime or KanaloaRuntime()
+        self._active_thinking_turns: set[str] = set()
 
         # Audit properties for testing & verification
-        self.last_sent_payload: dict[str, Any] | None = None
         self.last_stop_reason: str | None = None
 
     def capabilities(self) -> AgentCapabilities:
@@ -149,8 +156,18 @@ class KanaloaAdapter(BaseAdapter):
             return False
         return self._process.returncode is None
 
+    def is_available(self) -> bool:
+        if self._default_command and self._bundled_dsh is None:
+            return False
+        return bool(shutil.which(self.command[0]) or os.path.exists(self.command[0]))
+
+    async def activate(self) -> None:
+        """Start the bundled ACP runtime without creating a Conversation or Turn."""
+        await self._ensure_process()
+
     async def _cleanup_process(self) -> None:
         """Mechanical cleanup of subprocess, background tasks, and pending futures."""
+        initialized = self._is_initialized
         self._is_initialized = False
 
         # Reject any pending requests fail-closed so awaiting coroutines do not hang
@@ -172,18 +189,31 @@ class KanaloaAdapter(BaseAdapter):
         if self._process:
             if self._process.returncode is None:
                 try:
-                    self._process.terminate()
+                    # ACP owns stdin lifetime; EOF lets the Runtime dispose normally.
+                    if initialized and self._process.stdin is not None:
+                        self._process.stdin.close()
+                    else:
+                        self._process.terminate()
                     await asyncio.wait_for(self._process.wait(), timeout=2.0)
                 except Exception:
                     if self._process.returncode is None:
                         try:
-                            self._process.kill()
+                            self._process.terminate()
+                            await asyncio.wait_for(self._process.wait(), timeout=2.0)
                         except Exception:
-                            pass
+                            if self._process.returncode is None:
+                                self._process.kill()
+                                await self._process.wait()
+            logger.info(
+                "KanaloaAdapter: ACP process stopped exit_code=%s",
+                self._process.returncode if self._process.returncode is not None else "unknown",
+            )
             self._process = None
 
     async def _ensure_process(self) -> None:
         """Ensure ACP subprocess is launched and initialized."""
+        if not self.is_available():
+            raise RuntimeError("Bundled Kanaloa runtime is unavailable; run npm install in this repository")
         async with self._lock:
             if self.is_alive() and self._is_initialized:
                 return
@@ -191,7 +221,7 @@ class KanaloaAdapter(BaseAdapter):
             if self._process is not None:
                 await self._cleanup_process()
 
-            logger.info("KanaloaAdapter: launching ACP subprocess: %s", " ".join(self.command))
+            logger.info("KanaloaAdapter: launching ACP subprocess")
             self._process = await asyncio.create_subprocess_exec(
                 *self.command,
                 cwd=self.cwd,
@@ -204,19 +234,19 @@ class KanaloaAdapter(BaseAdapter):
 
             try:
                 # Perform ACP initialize handshake
-                init_resp = await self._send_request(
+                init_resp = await asyncio.wait_for(self._send_request(
                     "initialize",
                     {
                         "protocolVersion": 1,
                         "clientInfo": {"name": "kane-harness", "version": "2.0.0"},
                         "capabilities": {},
                     },
-                )
+                ), timeout=30)
                 if "error" in init_resp:
-                    raise RuntimeError(f"ACP initialization failed: {init_resp['error']}")
+                    raise RuntimeError("ACP initialization failed")
                 self._is_initialized = True
-                logger.info("KanaloaAdapter: initialized successfully with agentInfo: %s", init_resp.get("result", {}).get("agentInfo"))
-            except Exception:
+                logger.info("KanaloaAdapter: initialized successfully")
+            except BaseException:
                 await self._cleanup_process()
                 raise
 
@@ -272,7 +302,7 @@ class KanaloaAdapter(BaseAdapter):
                 msg = json.loads(line_str)
                 await self._handle_incoming_rpc(msg)
             except json.JSONDecodeError:
-                logger.warning("KanaloaAdapter: received non-JSON line from stdout: %s", line_str)
+                logger.warning("KanaloaAdapter: received non-JSON ACP stdout line")
 
         # Fail-closed cleanup when ACP subprocess stdout closes / process disconnects
         await self._handle_disconnect(reason="acp_process_disconnected")
@@ -284,7 +314,7 @@ class KanaloaAdapter(BaseAdapter):
             line = await self._process.stderr.readline()
             if not line:
                 break
-            logger.debug("[ACP STDERR] %s", line.decode("utf-8", errors="replace").strip())
+            logger.debug("KanaloaAdapter: ACP stderr line received")
 
     async def _handle_incoming_rpc(self, msg: dict[str, Any]) -> None:
         """Route incoming JSON-RPC response or notification."""
@@ -314,33 +344,64 @@ class KanaloaAdapter(BaseAdapter):
             return
 
         update = params.get("update", {})
-        update_type = update.get("type")
+        update_type = update.get("sessionUpdate") or update.get("type")
+        if not update_type:
+            return
 
-        if update_type == "content":
+        if update_type in ("agent_message_chunk", "content"):
+            if hasattr(self, "_active_thinking_turns"):
+                self._active_thinking_turns.discard(turn_id)
             content_block = update.get("content", {})
-            if content_block.get("type") == "text":
-                text = content_block.get("text", "")
-                if text:
-                    await self.event_handler.emit_delta(turn_id, text)
-                    self.runtime.record_delta(turn_id, text)
-        elif update_type in ("thought", "thinking"):
-            # Coarse live thinking status/event for UI; does NOT dump massive raw reasoning chains into turn_events
-            thought_text = update.get("thought") or update.get("content", "")
-            thinking_payload: dict[str, Any] = {"status": "thinking"}
-            if isinstance(thought_text, str) and thought_text.strip():
-                thinking_payload["summary"] = thought_text[:120].strip()
-            await self.event_handler.emit_event(turn_id, "thinking", thinking_payload)
-        elif update_type in ("tool_call", "tool_start", "tool_result", "tool_end"):
-            # Coarse tool event for UI observation (mapped to canonical EventType)
+            text = ""
+            if isinstance(content_block, dict):
+                if content_block.get("type") == "text" or "text" in content_block:
+                    text = content_block.get("text", "")
+            elif isinstance(content_block, str):
+                text = content_block
+            elif "text" in update:
+                text = update.get("text", "")
+
+            if text:
+                await self.event_handler.emit_delta(turn_id, text)
+                self.runtime.record_delta(turn_id, text)
+
+        elif update_type in ("agent_thought_chunk", "thought", "thinking"):
+            # Coarse live thinking status/event for UI; does NOT dump massive raw reasoning chains into turn_events or final text
+            if not hasattr(self, "_active_thinking_turns"):
+                self._active_thinking_turns = set()
+            if turn_id not in self._active_thinking_turns:
+                self._active_thinking_turns.add(turn_id)
+                await self.event_handler.emit_event(turn_id, "thinking", {"status": "thinking"})
+
+        elif update_type in ("tool_call", "tool_call_update", "tool_start", "tool_result", "tool_end"):
+            if hasattr(self, "_active_thinking_turns"):
+                self._active_thinking_turns.discard(turn_id)
             norm_event_type = "tool_start" if update_type in ("tool_call", "tool_start") else "tool_end"
-            tool_name = update.get("toolName") or update.get("name") or update.get("tool", "")
+            tool_name = (
+                update.get("toolName")
+                or update.get("name")
+                or update.get("tool")
+                or update.get("title")
+                or "tool"
+            )
+            tool_name = str(tool_name) if len(str(tool_name)) <= 40 and str(tool_name).isascii() and str(tool_name).replace("_", "").replace("-", "").isalnum() else "tool"
             tool_payload: dict[str, Any] = {
                 "type": update_type,
                 "tool": str(tool_name),
             }
-            if "status" in update:
+            tool_id = update.get("toolCallId") or update.get("id")
+            if tool_id:
+                tool_payload["tool_call_id"] = str(tool_id)
+            if update.get("status") in ("pending", "in_progress", "completed", "failed", "cancelled"):
                 tool_payload["status"] = update["status"]
             await self.event_handler.emit_event(turn_id, norm_event_type, tool_payload)
+
+        elif update_type == "usage_update":
+            # Usage updates (e.g. used/size token counters) are safely ignored without crashing
+            logger.debug("KanaloaAdapter: usage update for session %s", session_id)
+
+        else:
+            logger.debug("KanaloaAdapter: unhandled ACP session update")
 
     async def _handle_permission_request(self, msg: dict[str, Any]) -> None:
         """Handle permission request from ACP agent (e.g. tool execution / sandbox escalation)."""
@@ -376,6 +437,7 @@ class KanaloaAdapter(BaseAdapter):
             await self.event_handler.emit_waiting_user(
                 turn_id,
                 prompt=prompt_text,
+                record_message=False,
             )
 
     def get_pending_permission(self, request_id: str | int) -> PendingPermissionRequest | None:
@@ -516,6 +578,9 @@ class KanaloaAdapter(BaseAdapter):
             for turn_id in set(self._session_turns.values()) - turns_to_interrupt:
                 if self.event_handler.is_turn_active(turn_id):
                     await self.event_handler.emit_interrupted(turn_id, reason=reason)
+            self._active_sessions.clear()
+        else:
+            self._active_sessions.discard(session_id)
 
         # Reject pending RPC requests fail-closed so awaiting futures do not hang indefinitely (P1-01)
         if session_id is None:
@@ -525,22 +590,29 @@ class KanaloaAdapter(BaseAdapter):
                 if not fut.done():
                     fut.set_exception(RuntimeError(f"ACP process disconnected: {reason}"))
 
-        if session_id:
-            self.runtime.close_ipython_session(session_id)
-        else:
+        if hasattr(self, "_active_thinking_turns"):
+            if session_id:
+                tid = self._session_turns.get(session_id)
+                if tid:
+                    self._active_thinking_turns.discard(tid)
+            else:
+                self._active_thinking_turns.clear()
+
+        if not session_id:
             self.runtime.close_all()
 
     async def close(self) -> None:
         """Clean up active sessions and shutdown ACP process."""
+        session_ids = list(self._active_sessions)
         # 1. Invalidate pending permissions, loops & runtimes fail-closed
         await self._handle_disconnect(reason="adapter_closed", purge=False)
 
         # 2. Close active sessions gracefully
-        for session_id in list(self._active_sessions):
+        for session_id in session_ids:
             try:
                 await self._send_request("session/close", {"sessionId": session_id})
-            except Exception as e:
-                logger.debug("Failed closing session %s: %s", session_id, e)
+            except Exception as exc:
+                logger.debug("Failed closing session %s: %s", session_id, type(exc).__name__)
         self._active_sessions.clear()
         self._turn_sessions.clear()
         self._session_turns.clear()
@@ -587,8 +659,8 @@ class KanaloaAdapter(BaseAdapter):
         try:
             await self._ensure_process()
         except Exception as exc:
-            await self.event_handler.emit_interrupted(turn.turn_id, reason=f"acp_transport:{exc}")
-            raise RuntimeError(f"ACP transport unavailable: {exc}") from exc
+            await self.event_handler.emit_interrupted(turn.turn_id, reason=f"acp_transport:{type(exc).__name__}")
+            raise RuntimeError("ACP transport unavailable") from None
 
         session_id = turn.native_session_ref or self.get_native_session(turn.turn_id)
 
@@ -601,11 +673,11 @@ class KanaloaAdapter(BaseAdapter):
                     "mcpServers": [],
                 })
             except Exception as exc:
-                await self.event_handler.emit_interrupted(turn.turn_id, reason=f"acp_session:{exc}")
-                raise RuntimeError(f"ACP session unavailable: {exc}") from exc
+                await self.event_handler.emit_interrupted(turn.turn_id, reason=f"acp_session:{type(exc).__name__}")
+                raise RuntimeError("ACP session unavailable") from None
             if "error" in new_resp:
                 await self.event_handler.emit_interrupted(turn.turn_id, reason="acp_session_new_failed")
-                raise RuntimeError(f"ACP session/new failed: {new_resp['error']}")
+                raise RuntimeError("ACP session/new failed")
 
             session_id = new_resp["result"]["sessionId"]
             turn.native_session_ref = session_id
@@ -633,13 +705,6 @@ class KanaloaAdapter(BaseAdapter):
                 "text": message.content,
             })
 
-            payload = {
-                "method": "session/prompt",
-                "params": {
-                    "sessionId": session_id,
-                    "prompt": prompt_blocks,
-                },
-            }
             logger.debug(
                 "KanaloaAdapter: bootstrapped ACP session %s with %d context blocks",
                 session_id,
@@ -649,19 +714,10 @@ class KanaloaAdapter(BaseAdapter):
             turn.native_session_ref = session_id
             # State A: Active native session -> incremental message block only
             prompt_blocks = [{"type": "text", "text": message.content}]
-            payload = {
-                "method": "session/prompt",
-                "params": {
-                    "sessionId": session_id,
-                    "prompt": prompt_blocks,
-                },
-            }
             logger.debug(
                 "KanaloaAdapter: sending incremental prompt to active ACP session %s",
                 session_id,
             )
-
-        self.last_sent_payload = payload
 
         # Dispatch prompt in background so send() returns while prompt streams
         if max_iterations is not _UNSET:
@@ -701,30 +757,54 @@ class KanaloaAdapter(BaseAdapter):
                 "prompt": prompt_blocks,
             })
             if "error" in resp:
-                err_msg = resp["error"].get("message", "ACP prompt error")
-                await self.event_handler.emit_interrupted(turn_id, reason=f"acp_protocol:{err_msg}")
+                error_code = resp["error"].get("code", "unknown")
+                error_code = error_code if isinstance(error_code, int) else "unknown"
+                await self.event_handler.emit_interrupted(turn_id, reason=f"acp_protocol:{error_code}")
                 return
 
             result = resp.get("result", {})
             stop_reason = result.get("stopReason")
+            native_meta = result.get("_meta", {})
+            native_kind = native_meta.get("kaneNativeEndKind")
+            native_error_code = native_meta.get("kaneNativeErrorCode")
+            if not isinstance(native_error_code, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", native_error_code):
+                native_error_code = None
+            native_error_status = native_meta.get("kaneNativeErrorStatus")
+            if not isinstance(native_error_status, int) or isinstance(native_error_status, bool) or not 100 <= native_error_status <= 599:
+                native_error_status = None
+            native_error_source = native_meta.get("kaneNativeErrorSource")
+            if not isinstance(native_error_source, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", native_error_source):
+                native_error_source = None
+            stop_reason, native_kind, outcome = normalize_acp_outcome(stop_reason, native_kind)
             self.last_stop_reason = stop_reason
+            logger.info(
+                "KanaloaAdapter: prompt outcome turn=%s session=%s stop=%s native=%s error_code=%s error_status=%s error_source=%s",
+                turn_id, session_id, stop_reason, native_kind,
+                native_error_code or "unknown", native_error_status or "unknown", native_error_source or "unknown",
+            )
 
-            if stop_reason == "cancelled":
+            if not self.event_handler.is_turn_active(turn_id):
+                return
+            if outcome == "cancelled":
                 await self.event_handler.emit_interrupted(turn_id, reason="cancelled_by_acp")
-            elif stop_reason == "failed":
-                await self.event_handler.emit_failed(
-                    turn_id, reason=str(result.get("failureReason") or "agent_reported_failure")
-                )
-            else:
-                # Normal completion
+            elif outcome == "failed":
+                await self.event_handler.emit_failed(turn_id, reason="agent_reported_failure")
+            elif outcome == "completed":
                 await self.event_handler.emit_message_complete(
                     turn_id=turn_id,
                     sender_id="kanaloa",
                 )
+            else:
+                await self.event_handler.emit_interrupted(
+                    turn_id, reason=f"acp_stop:{stop_reason or 'missing'}:native_{native_kind or 'missing'}"
+                )
         except Exception as e:
-            logger.error("KanaloaAdapter prompt execution exception: %s", e)
+            logger.error("KanaloaAdapter prompt execution exception: %s", type(e).__name__)
             if self.event_handler.is_turn_active(turn_id):
-                await self.event_handler.emit_interrupted(turn_id, reason=f"acp_transport:{e}")
+                await self.event_handler.emit_interrupted(turn_id, reason=f"acp_transport:{type(e).__name__}")
+        finally:
+            if hasattr(self, "_active_thinking_turns"):
+                self._active_thinking_turns.discard(turn_id)
 
     def stop_loop(self, turn: Turn) -> None:
         """Signal runtime to gracefully stop continuing loop after current iteration."""
@@ -758,11 +838,10 @@ class KanaloaAdapter(BaseAdapter):
             })
         except Exception as exc:
             if self.event_handler.is_turn_active(turn.turn_id):
-                await self.event_handler.emit_interrupted(turn.turn_id, reason=f"acp_transport:{exc}")
-            raise RuntimeError(f"ACP steer transport unavailable: {exc}") from exc
+                await self.event_handler.emit_interrupted(turn.turn_id, reason=f"acp_transport:{type(exc).__name__}")
+            raise RuntimeError("ACP steer transport unavailable") from None
         if "error" in resp:
-            err_msg = resp["error"].get("message", str(resp["error"]))
-            raise RuntimeError(f"DSH steer failed: {err_msg}")
+            raise RuntimeError("DSH steer failed")
         logger.info(
             "KanaloaAdapter: successfully submitted native steer to session %s for turn %s",
             session_id,
@@ -798,48 +877,43 @@ class KanaloaAdapter(BaseAdapter):
         history: list[Message],
     ) -> None:
         """
-        Verified: ACP session/resume restores an existing persisted session.
+        ACP session/resume restores context, not unfinished execution.
         """
         session_id = turn.native_session_ref or self.get_native_session(turn.turn_id)
         if not session_id:
             raise ValueError(f"Cannot resume turn '{turn.turn_id}' without native_session_ref")
 
-        await self._ensure_process()
-
-        resp = await self._send_request("session/resume", {
-            "sessionId": session_id,
-            "cwd": self.cwd,
-        })
+        try:
+            await self._ensure_process()
+            resp = await self._send_request("session/resume", {
+                "sessionId": session_id,
+                "cwd": self.cwd,
+            })
+        except Exception as exc:
+            await self.event_handler.emit_interrupted(
+                turn.turn_id, reason=f"acp_resume_transport:{type(exc).__name__}"
+            )
+            raise RuntimeError("ACP session restore unavailable") from exc
         if "error" in resp:
-            raise RuntimeError(f"ACP session/resume failed: {resp['error']}")
+            raise RuntimeError("ACP session/resume failed")
 
         self._active_sessions.add(session_id)
-        logger.info("KanaloaAdapter: resumed session %s successfully", session_id)
+        self.bind_session(turn.turn_id, session_id)
+        # A subsequent explicit Send can continue this context without blind rerun.
+        await self.event_handler.emit_interrupted(
+            turn.turn_id, reason="session_rebound:unfinished_work_not_resumed"
+        )
+        logger.info("KanaloaAdapter: rebound session %s without resuming work", session_id)
 
     async def probe_session(self, native_session_ref: str | None) -> bool:
         """
-        Probe native session / process / transport truth for startup reconciliation (§30).
-        1. Physical process check: if process is dead or uninitialized, return False immediately.
-        2. If native_session_ref is active in memory, return True.
-        3. If process is alive and supports_resume, verify if session/resume succeeds with DSH ACP.
-        4. Otherwise return False.
-        Never relies on timeouts or guessing.
+        A resumable session is not proof that unfinished work survived restart.
+        Only a session active in this live ACP process can keep a turn running.
         """
         if not native_session_ref:
             return False
-        if not self.is_alive():
+        if not self.is_alive() or not self._is_initialized:
             return False
-        if native_session_ref in self._active_sessions:
-            return True
-        if self.capabilities().supports_resume:
-            try:
-                resp = await self._send_request("session/resume", {
-                    "sessionId": native_session_ref,
-                    "cwd": self.cwd,
-                })
-                if "error" not in resp:
-                    self._active_sessions.add(native_session_ref)
-                    return True
-            except Exception:
-                return False
-        return False
+        active = native_session_ref in self._active_sessions
+        logger.info("KanaloaAdapter: recovery probe session=%s live_work=%s", native_session_ref, active)
+        return active

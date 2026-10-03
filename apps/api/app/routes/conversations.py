@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from typing import Any
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..domain.models import Conversation, Message, Turn
+from ..harness.coordinator import HarnessCoordinator
 from ..harness.dispatcher import Dispatcher
 from ..store.base import BaseStore
-from .deps import get_dispatcher, get_store
+from .deps import get_coordinator, get_dispatcher, get_store
 
 router = APIRouter(tags=["conversations"])
 
@@ -27,6 +28,18 @@ class SendMessageRequest(BaseModel):
     reply_to_message_id: str | None = None
     loop_mode: bool = False
     max_iterations: int | None = Field(default=5, gt=0)
+
+
+class RenameConversationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=256)
+
+    @field_validator("title")
+    @classmethod
+    def nonempty_title(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Title cannot be blank")
+        return value.strip()
 
 
 class SendMessageResponse(BaseModel):
@@ -61,8 +74,11 @@ class BranchResponse(BaseModel):
 async def create_conversation(
     body: CreateConversationRequest,
     store: BaseStore = Depends(get_store),
+    coordinator: HarnessCoordinator = Depends(get_coordinator),
 ) -> Conversation:
     """Create a new conversation container without auto-starting turns or agents (§4)."""
+    if not coordinator.has_adapter(body.bound_agent_id):
+        raise HTTPException(status_code=400, detail=f"Agent '{body.bound_agent_id}' is not connected")
     conv = Conversation(
         title=body.title,
         bound_agent_id=body.bound_agent_id,
@@ -91,6 +107,25 @@ async def get_conversation(
             status_code=404, detail=f"Conversation '{conversation_id}' not found"
         )
     return conv
+
+
+@router.patch("/conversations/{conversation_id}", response_model=Conversation)
+async def rename_conversation(conversation_id: str, body: RenameConversationRequest, store: BaseStore = Depends(get_store)) -> Conversation:
+    conversation = store.update_conversation_title(conversation_id, body.title)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return conversation
+
+
+@router.delete("/conversations/{conversation_id}", status_code=204)
+async def delete_conversation(conversation_id: str, store: BaseStore = Depends(get_store)) -> Response:
+    try:
+        deleted = store.delete_conversation(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return Response(status_code=204)
 
 
 @router.get("/conversations/{conversation_id}/messages", response_model=list[Message])

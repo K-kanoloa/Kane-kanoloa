@@ -98,7 +98,7 @@ class WireBranchMockKanaloaAdapter(KanaloaAdapter):
             return {"result": {"sessionId": sess_id}}
         if method == "session/prompt":
             self.prompt_requests.append(params or {})
-            return {"result": {"stopReason": "endTurn"}}
+            return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
         if method == "session/resume":
             self.resume_requests.append(params or {})
             sess_id = params.get("sessionId") if params else None
@@ -577,8 +577,20 @@ async def test_startup_reconcile_running_turn_with_live_native_session(harness_e
 
 
 @pytest.mark.asyncio
-async def test_startup_reconcile_running_turn_with_resumable_session(harness_env):
-    """Verify startup reconciliation successfully recovers resumable session over ACP."""
+async def test_startup_keeps_unsent_explicit_turn(harness_env):
+    store, _, coord, _ = harness_env
+    turn = Turn(turn_id="t_unsent", conversation_id="c_rec", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn)
+
+    reconciled = await coord.reconcile_startup_turns()
+
+    assert reconciled[turn.turn_id] == "running"
+    assert store.get_turn(turn.turn_id).interrupt_reason is None
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_resumable_session_does_not_claim_live_work(harness_env):
+    """Session rebind alone cannot prove unfinished work survived process restart."""
     store, mbx_mgr, coord, dispatcher = harness_env
     kanaloa = WireBranchMockKanaloaAdapter(event_handler=coord)
     coord.register_adapter("kanaloa", kanaloa)
@@ -589,10 +601,78 @@ async def test_startup_reconcile_running_turn_with_resumable_session(harness_env
 
     reconciled = await coord.reconcile_startup_turns()
 
-    assert reconciled.get("t_resumable") == "running"
-    assert store.get_turn("t_resumable").status == "running"
-    assert len(kanaloa.resume_requests) == 1
+    assert reconciled.get("t_resumable") == "interrupted"
+    assert store.get_turn("t_resumable").status == "interrupted"
+    assert kanaloa.resume_requests == []
+    assert kanaloa.prompt_requests == []
+
+    await kanaloa.resume(store.get_turn("t_resumable"), [])
     assert kanaloa.resume_requests[0]["sessionId"] == "sess_saved_100"
+    assert kanaloa.prompt_requests == []
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_rebind_then_send_continues_without_idle_steer(harness_env):
+    store, _, coord, dispatcher = harness_env
+    kanaloa = WireBranchMockKanaloaAdapter(event_handler=coord)
+    coord.register_adapter("kanaloa", kanaloa)
+    store.save_conversation(Conversation(conversation_id="c_rebind", bound_agent_id="kanaloa"))
+    store.save_turn(Turn(
+        turn_id="t_rebind", conversation_id="c_rebind", bound_agent_id="kanaloa",
+        status="interrupted", native_session_ref="sess_saved_100", partial_output="partial",
+    ))
+    store.append_message(Message(
+        message_id="m_before", conversation_id="c_rebind", turn_id="t_rebind",
+        sender="user", content="original work",
+    ))
+    kanaloa.resumable_sessions.add("sess_saved_100")
+    kanaloa.steer = AsyncMock(side_effect=AssertionError("Idle session must not be steered"))
+
+    rebound = await dispatcher.resume_turn("t_rebind")
+    assert rebound.status == "interrupted"
+    assert rebound.interrupt_reason == "session_rebound:unfinished_work_not_resumed"
+    assert rebound.partial_output == "partial"
+    assert kanaloa.prompt_requests == []
+
+    await dispatcher.dispatch_user_message("c_rebind", "Continue", target_turn_id="t_rebind")
+    await asyncio.sleep(0.02)
+    kanaloa.steer.assert_not_called()
+    assert len(kanaloa.prompt_requests) == 1
+    assert kanaloa.prompt_requests[0]["sessionId"] == "sess_saved_100"
+    assert kanaloa.session_new_calls == []
+    assert store.get_turn("t_rebind").status == "finished"
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_resume_timeout_is_transport_interruption(harness_env):
+    store, _, coord, dispatcher = harness_env
+    kanaloa = WireBranchMockKanaloaAdapter(event_handler=coord)
+    coord.register_adapter("kanaloa", kanaloa)
+    store.save_turn(Turn(
+        turn_id="t_resume_timeout", conversation_id="c_rec", bound_agent_id="kanaloa",
+        status="interrupted", native_session_ref="sess_saved_100",
+    ))
+    kanaloa._ensure_process = AsyncMock(side_effect=TimeoutError())
+    with pytest.raises(RuntimeError, match="ACP session restore unavailable"):
+        await dispatcher.resume_turn("t_resume_timeout")
+    assert store.get_turn("t_resume_timeout").status == "interrupted"
+    assert store.get_turn("t_resume_timeout").interrupt_reason == "acp_resume_transport:TimeoutError"
+    assert kanaloa.prompt_requests == []
+
+
+@pytest.mark.asyncio
+async def test_probe_session_only_accepts_live_in_process_work(harness_env):
+    _, _, coord, _ = harness_env
+    kanaloa = WireBranchMockKanaloaAdapter(event_handler=coord)
+    kanaloa.resumable_sessions.add("sess_saved_100")
+
+    assert not await kanaloa.probe_session("sess_saved_100")
+    assert kanaloa.resume_requests == []
+    kanaloa._is_initialized = True
+    kanaloa._active_sessions.add("sess_saved_100")
+    assert await kanaloa.probe_session("sess_saved_100")
+    await kanaloa._handle_disconnect(reason="acp_process_disconnected")
+    assert not await kanaloa.probe_session("sess_saved_100")
 
 
 @pytest.mark.asyncio
@@ -661,15 +741,15 @@ async def test_startup_reconcile_resume_failure_marks_interrupted(harness_env):
 
 @pytest.mark.asyncio
 async def test_startup_reconcile_waiting_user_is_not_blindly_resumed(harness_env):
-    """Verify waiting_user turns remain waiting_user during reconciliation pass."""
+    """A waiting_user turn with no live adapter must not stay waiting forever."""
     store, mbx_mgr, coord, dispatcher = harness_env
     turn = Turn(turn_id="t_wait", conversation_id="c_rec", bound_agent_id="mock", status="waiting_user")
     store.save_turn(turn)
 
     reconciled = await coord.reconcile_startup_turns()
 
-    assert "t_wait" not in reconciled
-    assert store.get_turn("t_wait").status == "waiting_user"
+    assert reconciled["t_wait"] == "interrupted"
+    assert store.get_turn("t_wait").status == "interrupted"
 
 
 @pytest.mark.asyncio

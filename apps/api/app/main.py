@@ -19,12 +19,14 @@ from .harness.mailbox import MailboxManager
 from .harness.coordinator import HarnessCoordinator
 from .harness.dispatcher import Dispatcher
 from .adapters.kanaloa_adapter import KanaloaAdapter
+from .adapters.connector_adapter import ConnectorAdapter
 from .adapters.kanaloa_runtime import KanaloaRuntime
 
 from .routes.health import router as health_router
 from .routes.conversations import router as conversations_router
 from .routes.turns import router as turns_router
 from .routes.agents import router as agents_router
+from .routes.connectors import router as connectors_router
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +68,28 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         coordinator.register_adapter("kanaloa", adapter)
         app.state.kanaloa_runtime = runtime
         app.state.kanaloa_adapter = adapter
+
+    # Restore stable identities for paired remote Connectors as offline adapters.
+    for binding in store.list_agent_bindings():
+        if binding.adapter_name == "kane_connector" and binding.is_active and not coordinator.has_adapter(binding.agent_id):
+            coordinator.register_adapter(
+                binding.agent_id,
+                ConnectorAdapter(
+                    binding.agent_id,
+                    binding.capabilities,
+                    coordinator,
+                    configured=bool(binding.config.get("connector_token_sha256")),
+                ),
+            )
+
+    binding = store.get_agent_binding("kanaloa")
+    if binding and binding.config.get("auto_start"):
+        adapter = coordinator.get_adapter("kanaloa")
+        if isinstance(adapter, KanaloaAdapter):
+            try:
+                await adapter.activate()
+            except Exception:
+                logger.exception("Kanaloa auto-start failed; Kane Core remains available")
 
     # 5. Startup Reconciliation Pass: MUST complete before serving requests (§1, §30)
     mark("lifespan.reconciliation.begin")
@@ -112,6 +136,7 @@ def create_app() -> FastAPI:
     app.include_router(conversations_router, prefix="/api/v1")
     app.include_router(turns_router, prefix="/api/v1")
     app.include_router(agents_router, prefix="/api/v1")
+    app.include_router(connectors_router, prefix="/api/v1")
     mark("routers.registered")
 
     return app

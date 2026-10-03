@@ -204,6 +204,26 @@ class SQLiteStore(BaseStore):
                 conn.execute("ALTER TABLE messages ADD COLUMN turn_id TEXT;")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_turn_id ON messages (turn_id);")
 
+    def update_conversation_title(self, conversation_id: str, title: str) -> Conversation | None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute("UPDATE conversations SET title = ? WHERE conversation_id = ?", (title, conversation_id))
+        return self.get_conversation(conversation_id)
+
+    def delete_conversation(self, conversation_id: str) -> bool:
+        conn = self._get_connection()
+        with conn:
+            # The active check and deletion share a write transaction.
+            conn.execute("BEGIN IMMEDIATE")
+            if not conn.execute("SELECT 1 FROM conversations WHERE conversation_id = ?", (conversation_id,)).fetchone():
+                return False
+            if conn.execute("SELECT 1 FROM turns WHERE conversation_id = ? AND status IN ('running', 'waiting_user')", (conversation_id,)).fetchone():
+                raise ValueError("Stop active Turns before deleting this conversation")
+            conn.execute("DELETE FROM inbound_delivery WHERE turn_id IN (SELECT turn_id FROM turns WHERE conversation_id = ?) OR message_id IN (SELECT message_id FROM messages WHERE conversation_id = ?)", (conversation_id, conversation_id))
+            for table in ("turn_events", "branches", "messages", "turns", "conversations"):
+                conn.execute(f"DELETE FROM {table} WHERE conversation_id = ?", (conversation_id,))
+        return True
+
     # --- Branch Boundary Operations (§16, §17) ---
     def save_branch(self, branch: BranchBoundary) -> None:
         conn = self._get_connection()
@@ -239,7 +259,7 @@ class SQLiteStore(BaseStore):
     def list_branches(self, conversation_id: str) -> list[BranchBoundary]:
         conn = self._get_connection()
         rows = conn.execute(
-            "SELECT * FROM branches WHERE conversation_id = ? ORDER BY created_at ASC;",
+            "SELECT * FROM branches WHERE conversation_id = ? ORDER BY julianday(created_at) ASC, rowid ASC;",
             (conversation_id,),
         ).fetchall()
         return [BranchBoundary(**dict(r)) for r in rows]
@@ -298,7 +318,7 @@ class SQLiteStore(BaseStore):
     def list_conversations(self) -> list[Conversation]:
         conn = self._get_connection()
         rows = conn.execute(
-            "SELECT * FROM conversations ORDER BY updated_at DESC;"
+            "SELECT * FROM conversations ORDER BY julianday(updated_at) DESC, rowid DESC;"
         ).fetchall()
         return [Conversation(**dict(r)) for r in rows]
 
@@ -338,6 +358,10 @@ class SQLiteStore(BaseStore):
                     "INSERT INTO inbound_delivery (message_id, turn_id, kind, state) VALUES (?, ?, ?, 'pending')",
                     (message.message_id, message.turn_id, delivery_kind),
                 )
+            conn.execute(
+                "UPDATE conversations SET updated_at = ? WHERE conversation_id = ?",
+                (message.created_at, message.conversation_id),
+            )
 
     def list_unsettled_inbound(self) -> list[tuple[str, str, str, str]]:
         rows = self._get_connection().execute(
@@ -406,7 +430,7 @@ class SQLiteStore(BaseStore):
             """
             SELECT * FROM messages
             WHERE conversation_id = ?
-            ORDER BY created_at ASC;
+            ORDER BY julianday(created_at) ASC, rowid ASC;
             """,
             (conversation_id,),
         ).fetchall()
@@ -506,20 +530,20 @@ class SQLiteStore(BaseStore):
             """
             SELECT * FROM turns
             WHERE conversation_id = ?
-            ORDER BY created_at ASC;
+            ORDER BY julianday(created_at) ASC, rowid ASC;
             """,
             (conversation_id,),
         ).fetchall()
         return [Turn(**self._normalize_turn_data(dict(r))) for r in rows]
 
-    def list_running_turns(self) -> list[Turn]:
-        """List all turns currently in 'running' status across all conversations (for startup reconciliation)."""
+    def list_active_turns(self) -> list[Turn]:
+        """List running and waiting_user turns for startup liveness reconciliation."""
         conn = self._get_connection()
         rows = conn.execute(
             """
             SELECT * FROM turns
-            WHERE status = 'running'
-            ORDER BY created_at ASC;
+            WHERE status IN ('running', 'waiting_user')
+            ORDER BY julianday(created_at) ASC, rowid ASC;
             """
         ).fetchall()
         return [Turn(**self._normalize_turn_data(dict(r))) for r in rows]
@@ -531,8 +555,7 @@ class SQLiteStore(BaseStore):
         status_event: TurnEvent | None = None,
     ) -> None:
         """
-        Atomically persist final Message, clear Turn partial_output, set Turn status to finished,
-        and optionally append completion TurnEvent in a single ACID transaction.
+        Atomically persist a logical Message and its Turn status/event in one transaction.
         """
         conn = self._get_connection()
         turn_id = message.turn_id or turn.turn_id
@@ -559,7 +582,11 @@ class SQLiteStore(BaseStore):
                     message.created_at,
                 ),
             )
-            # 2. Update turn atomically: clear partial_output, set finished status and finished_at
+            # 2. Update turn atomically with the supplied runtime status.
+            conn.execute(
+                "UPDATE conversations SET updated_at = ? WHERE conversation_id = ?",
+                (message.created_at, message.conversation_id),
+            )
             conn.execute(
                 """
                 INSERT INTO turns (
@@ -632,7 +659,7 @@ class SQLiteStore(BaseStore):
             """
             SELECT * FROM turn_events
             WHERE turn_id = ?
-            ORDER BY created_at ASC;
+            ORDER BY julianday(created_at) ASC, rowid ASC;
             """,
             (turn_id,),
         ).fetchall()
@@ -644,6 +671,11 @@ class SQLiteStore(BaseStore):
         return events
 
     # --- Agent Binding Operations ---
+    def delete_agent_binding(self, agent_id: str) -> None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute("DELETE FROM agent_bindings WHERE agent_id = ?", (agent_id,))
+
     def save_agent_binding(self, binding: AgentBinding) -> None:
         conn = self._get_connection()
         with conn:

@@ -1,67 +1,51 @@
-# External Agent Integration
+# External Agent Connector Integration
 
-Kane v2.0.0 integrates external or local agents through the API worker and Local Bridge. This document describes current behavior only.
+Kane vNext accepts external Agents through the generic Agent-side Kane
+Connector Protocol. The Agent Connector initiates and maintains an outbound
+WebSocket to Kane; Kane Core does not discover or launch Codex, Claude, Pi, or
+other Agent executables.
 
-## Integration Matrix
+## Responsibility Boundaries
 
-| Agent / adapter | Path | When it counts as automated |
-|---|---|---|
-| Builtin Kanaloa | API worker | Does not require Bridge. Task, run, and run steps should converge to terminal status. |
-| Codex CLI | API -> Bridge `/v1/execute`, `adapter_id=codex_cli` | Only when the local CLI exists and the OS permits execution. Permission errors are recorded as real failures. |
-| Cursor | API -> Bridge `/v1/execute`, `adapter_id=cursor_cli` | Handoff-oriented in v2.0.0. Kane writes handoff work and waits for real completion. |
-| Claude Code | API -> Bridge `/v1/execute`, `adapter_id=claude_code` | Uses local CLI when available; otherwise handoff. |
-| OpenClaw HTTP | Bridge posts to `OPENCLAW_WEBHOOK_URL` | Automated only when webhook is configured and returns a real success response. |
-| Local script | Bridge `subprocess` path | Trusted local use only, with explicit configured command metadata. |
+| Piece | Responsibility |
+|---|---|
+| Kane Connector Protocol | The single versioned wire contract in `KANE_CONNECTOR_PROTOCOL.md`. |
+| Kane `ConnectorAdapter` | Generic translation between protocol frames and Kane's existing adapter contract. |
+| Agent Connector | Native Agent protocol, session binding, event parsing, and subprocess/transport lifecycle. |
+| Kane Connect Skill | Agent-neutral instructions for implementing or operating a Connector. |
+| Kane MCP | Optional bootstrap, discovery, health probe, and shared trace validation; not chat transport. |
+| Kanaloa | Bundled first-party Agent/runtime; its DSH/ACP path remains separate and unchanged. |
 
-## Completion Callback
+Codex is the Golden Reference Connector under `connectors/codex/`. Codex
+app-server JSON-RPC and native session details stay in that directory. The old
+v2 Local Bridge task execution route is not the vNext Codex integration path.
 
-External or handoff flows can complete a run through:
+## Connection Flow
 
-```text
-POST {OCTOPUS_API_PUBLIC_URL}/integrations/bridge/complete
-```
+1. An authorized Kane client creates an Agent identity and one-time pairing
+   code through `POST /api/v1/agents/pairings`.
+2. The Agent-side Connector opens
+   `ws(s)://<kane-host>/api/v1/connectors/ws` with the pairing credential.
+3. The Connector sends `connector.hello`; Kane returns `connector.ready` and a
+   one-time scoped reconnect token.
+4. Kane sends `turn.send`; the Connector acknowledges delivery and translates
+   it to the selected Agent's native session.
+5. The Connector returns optional `reply.delta` frames and one explicit
+   `reply.completed` for a logical reply. Kane persists one Message for that
+   reply ID.
 
-Example body:
+The Connector identity remains registered while offline. Online state comes
+from the authenticated live socket, not from installation or pairing alone.
+Advanced operations are optional capabilities and must not be emulated when
+the native Agent does not support them.
 
-```json
-{
-  "task_id": "task_...",
-  "run_id": "run_...",
-  "status": "succeeded",
-  "output": "result text",
-  "error": null,
-  "integration_path": "manual_handoff"
-}
-```
+## Validation
 
-If `OCTOPUS_BRIDGE_SHARED_SECRET` is configured, include:
+Use the shared conformance validator in `connectors/conformance/` on a
+redacted protocol trace, then run a real end-to-end test against the native
+Agent. The shared trace validator does not prove native execution. Report the
+tested Agent version, native interface, declared capabilities, and any
+unverified lifecycle behavior.
 
-```text
-X-Octopus-Bridge-Key: <secret>
-```
-
-The environment variable and header names are retained for compatibility in v2.0.0.
-
-## Honest Status Rules
-
-- Missing CLI means unavailable or handoff, not fake online.
-- OS permission errors are failures or needs-attention states, not success.
-- Cursor handoff is not full headless execution.
-- Webhook success requires a real 2xx response from the configured endpoint.
-- High-risk local command execution should remain owner-controlled and local/private.
-
-## Runtime Data
-
-External agent handoff files and bridge results live under:
-
-```text
-apps/local-bridge/data/
-```
-
-API task, run, run-step, verifier, repair, memory, and compiler records live under:
-
-```text
-apps/data/
-```
-
-Both directories are ignored by Git. Do not commit runtime JSON, local test tasks, handoff files, logs, or secrets.
+See `KANE_CONNECTOR_PROTOCOL.md`, `connectors/codex/README.md`,
+`connectors/kane-mcp/README.md`, and `skills/kane-connect/SKILL.md`.

@@ -1,3 +1,5 @@
+param([switch]$WithBridge)
+
 $ErrorActionPreference = "Stop"
 
 $ApiBase = if ($env:E2E_API_BASE_URL) { $env:E2E_API_BASE_URL } else { "http://127.0.0.1:8000" }
@@ -7,9 +9,10 @@ $TimeoutSeconds = if ($env:E2E_WAIT_TIMEOUT_SECONDS) { [int]$env:E2E_WAIT_TIMEOU
 
 $Targets = @(
   @{ Name = "api"; Url = "$ApiBase/health" },
-  @{ Name = "bridge"; Url = "$BridgeBase/health" },
-  @{ Name = "web"; Url = "$WebBase/" }
+  @{ Name = "web"; Url = "$WebBase/" },
+  @{ Name = "web-api"; Url = "$WebBase/api/proxy/health" }
 )
+if ($WithBridge) { $Targets += @{ Name = "bridge"; Url = "$BridgeBase/health" } }
 
 function Test-EndpointReady {
   param([string]$Url)

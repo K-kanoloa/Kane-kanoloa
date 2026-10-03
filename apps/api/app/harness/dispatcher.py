@@ -51,6 +51,12 @@ class Dispatcher:
         3. Conversation focus_turn_id
         4. Fresh Turn creation
         """
+        reply = None
+        if reply_to_message_id:
+            reply = self.store.get_message(reply_to_message_id)
+            if not reply or reply.conversation_id != conversation_id:
+                raise ValueError("Reply target must belong to this Conversation")
+
         # 1. Explicit turn requested
         if explicit_turn_id:
             turn = self.store.get_turn(explicit_turn_id)
@@ -72,21 +78,11 @@ class Dispatcher:
             self.store.save_conversation(conv)
 
         # 2. Reply-to message
-        if reply_to_message_id:
-            msg_turn_id = self.store.get_turn_id_by_message_id(reply_to_message_id)
-            if msg_turn_id:
-                target_turn = self.store.get_turn(msg_turn_id)
+        if reply:
+            if reply.turn_id:
+                target_turn = self.store.get_turn(reply.turn_id)
                 if target_turn and target_turn.conversation_id == conversation_id:
                     return target_turn
-            msg = self.store.get_message(reply_to_message_id)
-            if msg and msg.turn_id:
-                target_turn = self.store.get_turn(msg.turn_id)
-                if target_turn and target_turn.conversation_id == conversation_id:
-                    return target_turn
-            if msg and conv.focus_turn_id:
-                focus = self.store.get_turn(conv.focus_turn_id)
-                if focus:
-                    return focus
 
         # 3. Focus turn on conversation
         if conv.focus_turn_id:
@@ -219,6 +215,8 @@ class Dispatcher:
         all_turns = self.store.list_turns(conversation_id)
 
         branch = self.store.get_branch(turn.branch_id) if turn.branch_id and turn.branch_id != "main" else None
+        if turn.branch_id != "main" and (not branch or branch.conversation_id != conversation_id):
+            raise ValueError("Branch must belong to this Conversation")
         branch_point = branch.branch_point_message_id if branch else None
 
         if branch_point:
@@ -275,6 +273,11 @@ class Dispatcher:
         if not target_branch_id:
             target_branch_id = "main"
 
+        if target_branch_id != "main":
+            branch = self.store.get_branch(target_branch_id)
+            if not branch or branch.conversation_id != conversation_id:
+                raise ValueError("Branch must belong to this Conversation")
+
         new_turn = Turn(
             conversation_id=conversation_id,
             bound_agent_id=conv.bound_agent_id,
@@ -314,6 +317,10 @@ class Dispatcher:
 
         # 1. Deterministic Turn Resolution first
         if is_new_task:
+            if reply_to_message_id:
+                reply = self.store.get_message(reply_to_message_id)
+                if not reply or reply.conversation_id != conversation_id:
+                    raise ValueError("Reply target must belong to this Conversation")
             turn = self.create_new_turn(conversation_id)
         else:
             turn = self.resolve_target_turn(
@@ -330,9 +337,27 @@ class Dispatcher:
             if turn.bound_agent_id != "kanaloa":
                 raise ValueError("Loop Mode is only available for Kanaloa")
 
-        needs_initial_send = False
-        if turn.status == "running" and hasattr(adapter, "get_native_session"):
-            needs_initial_send = not (turn.native_session_ref or adapter.get_native_session(turn.turn_id))
+        has_prior_input = any(
+            message.turn_id == turn.turn_id and message.sender == "user"
+            for message in self.store.get_messages(conversation_id)
+        )
+        needs_initial_send = turn.status == "running" and not has_prior_input
+        if needs_initial_send or turn.status in ("finished", "failed", "interrupted"):
+            active_others = [
+                other for other in self.store.list_active_turns()
+                if other.turn_id != turn.turn_id
+                and other.bound_agent_id == turn.bound_agent_id
+                and (
+                    other.native_session_ref
+                    or any(
+                        message.turn_id == other.turn_id and message.sender == "user"
+                        for message in self.store.get_messages(other.conversation_id)
+                    )
+                )
+            ]
+            parallel_limit = caps.max_parallel_sessions if caps.supports_parallel_sessions else 1
+            if parallel_limit is not None and len(active_others) >= parallel_limit:
+                raise RuntimeError(f"Agent '{turn.bound_agent_id}' has no available parallel session")
         if loop_mode and turn.status == "running" and not needs_initial_send:
             raise ValueError("Loop Mode must be selected before a Turn starts or on a follow-up")
         if loop_mode and turn.status == "waiting_user":
@@ -345,36 +370,11 @@ class Dispatcher:
             elif caps.steer_mode == "follow_up_only":
                 queued_kind = "message"
 
-        # Resolve effective parent_id for branch lineage
+        # Validate branch ownership and reuse its visible history for parent and delivery.
+        visible_history = self.get_turn_history(turn)
         effective_parent_id = parent_id
-        if effective_parent_id is None:
-            # Look up messages already belonging to this branch
-            branch_turn_ids = {
-                t.turn_id for t in self.store.list_turns(conversation_id)
-                if getattr(t, "branch_id", "main") == turn.branch_id
-            }
-            branch_msgs = [
-                m for m in self.store.get_messages(conversation_id)
-                if m.turn_id in branch_turn_ids
-            ]
-            if branch_msgs:
-                effective_parent_id = branch_msgs[-1].message_id
-            else:
-                # First message in this branch:
-                branch = self.store.get_branch(turn.branch_id) if turn.branch_id and turn.branch_id != "main" else None
-                if branch and branch.branch_point_message_id:
-                    effective_parent_id = branch.branch_point_message_id
-                else:
-                    # Root message in main branch: link to last main message if any
-                    main_turn_ids = {
-                        t.turn_id for t in self.store.list_turns(conversation_id)
-                        if getattr(t, "branch_id", "main") == "main"
-                    }
-                    main_msgs = [
-                        m for m in self.store.get_messages(conversation_id)
-                        if m.turn_id in main_turn_ids
-                    ]
-                    effective_parent_id = main_msgs[-1].message_id if main_msgs else None
+        if effective_parent_id is None and visible_history:
+            effective_parent_id = visible_history[-1].message_id
 
         # 2. Append User Message with explicit turn_id
         user_msg = Message(
@@ -385,7 +385,22 @@ class Dispatcher:
             parent_id=effective_parent_id,
             content=content,
         )
-        self.store.append_message(user_msg, delivery_kind=queued_kind)
+        direct_kind = "steer" if turn.status == "running" and not needs_initial_send else "message"
+        self.store.append_message(user_msg, delivery_kind=queued_kind or direct_kind)
+
+        async def deliver_send(history: list[Message]) -> None:
+            if not self.store.claim_inbound(user_msg.message_id):
+                raise RuntimeError("Input is already being delivered")
+            try:
+                if loop_mode:
+                    await adapter.send(turn, user_msg, history, max_iterations=max_iterations)
+                else:
+                    await adapter.send(turn, user_msg, history)
+            except Exception as exc:
+                if self.coordinator.is_turn_active(turn.turn_id):
+                    await self.coordinator.emit_interrupted(turn.turn_id, reason=f"delivery_outcome_unknown:{exc}")
+                raise
+            self.store.complete_inbound(user_msg.message_id)
 
         # 4. Turn Status Lifecycle Handling
         if turn.status in ("finished", "failed", "interrupted"):
@@ -396,11 +411,7 @@ class Dispatcher:
             turn.last_event_at = current_iso()
             self.store.save_turn(turn)
 
-            history = [m for m in self.get_turn_history(turn) if m.message_id != user_msg.message_id]
-            if loop_mode:
-                await adapter.send(turn, user_msg, history, max_iterations=max_iterations)
-            else:
-                await adapter.send(turn, user_msg, history)
+            await deliver_send(visible_history)
 
         elif turn.status == "waiting_user":
             # Resume waiting turn
@@ -408,24 +419,25 @@ class Dispatcher:
             turn.last_event_at = current_iso()
             self.store.save_turn(turn)
 
-            history = [m for m in self.get_turn_history(turn) if m.message_id != user_msg.message_id]
-            await adapter.send(turn, user_msg, history)
+            await deliver_send(visible_history)
 
         elif turn.status == "running":
-            # If the adapter manages native sessions and no native session has been established yet for this turn
-            # (e.g. initial message for a brand new turn or a newly created branch turn),
-            # this message is the turn's initial bootstrap send, not a mid-flight steer.
+            # The first user input on a Turn is a send, even when a Branch already has a session.
             if needs_initial_send:
-                history = [m for m in self.get_turn_history(turn) if m.message_id != user_msg.message_id]
-                if loop_mode:
-                    await adapter.send(turn, user_msg, history, max_iterations=max_iterations)
-                else:
-                    await adapter.send(turn, user_msg, history)
+                await deliver_send(visible_history)
             else:
                 # Turn is actively running -> Steer Degradation
                 steer_mode = caps.steer_mode
                 if steer_mode == "native":
-                    await adapter.steer(turn, user_msg)
+                    if not self.store.claim_inbound(user_msg.message_id):
+                        raise RuntimeError("Input is already being delivered")
+                    try:
+                        await adapter.steer(turn, user_msg)
+                    except Exception as exc:
+                        if self.coordinator.is_turn_active(turn.turn_id):
+                            await self.coordinator.emit_interrupted(turn.turn_id, reason=f"delivery_outcome_unknown:{exc}")
+                        raise
+                    self.store.complete_inbound(user_msg.message_id)
                 elif steer_mode == "safe_boundary":
                     mailbox = self.mailbox_manager.get_mailbox(turn.turn_id)
                     await mailbox.put(
@@ -468,7 +480,8 @@ class Dispatcher:
         try:
             await adapter.send(turn, followup_msg, history)
         except Exception as exc:
-            await self.coordinator.emit_interrupted(turn.turn_id, reason=f"delivery_outcome_unknown:{exc}")
+            if self.coordinator.is_turn_active(turn.turn_id):
+                await self.coordinator.emit_interrupted(turn.turn_id, reason=f"delivery_outcome_unknown:{exc}")
             return
         self.store.complete_inbound(followup_msg.message_id)
 
@@ -514,7 +527,8 @@ class Dispatcher:
         try:
             await adapter.resume(turn, history)
         except Exception as exc:
-            await self.coordinator.emit_interrupted(turn_id, reason=f"resume_transport:{exc}")
+            if self.coordinator.is_turn_active(turn_id):
+                await self.coordinator.emit_interrupted(turn_id, reason=f"resume_transport:{exc}")
             raise
         return self.store.get_turn(turn_id)
 

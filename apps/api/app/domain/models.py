@@ -9,7 +9,7 @@ Disciplines:
 
 from __future__ import annotations
 
-import time
+from datetime import datetime, timezone
 from typing import Any, Literal
 from pydantic import BaseModel, Field
 
@@ -17,7 +17,7 @@ from ..id_utils import new_id
 
 
 def current_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 # --- Message ---

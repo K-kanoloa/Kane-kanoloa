@@ -46,10 +46,11 @@ class AgentEventHandler(ABC):
         turn_id: str,
         content: str | None = None,
         sender_id: str | None = None,
+        turn_finished: bool = True,
+        message_id: str | None = None,
     ) -> Message:
         """
-        Signal completion of one logical reply.
-        Persists ONE permanent Message to store, clears partial_output, transitions Turn to 'finished'.
+        Signal completion of one logical reply; the Turn may continue working.
         """
         ...
 
@@ -58,8 +59,9 @@ class AgentEventHandler(ABC):
         self,
         turn_id: str,
         prompt: str | None = None,
+        record_message: bool = True,
     ) -> None:
-        """Agent pauses execution awaiting user input or approval. Transitions Turn to 'waiting_user'."""
+        """Agent question becomes a Message; protocol approval remains an event."""
         ...
 
     @abstractmethod
@@ -111,7 +113,7 @@ class AgentEventHandler(ABC):
 class BaseAdapter(ABC):
     """
     Generic Bidirectional Agent Adapter interface.
-    Every external Agent (Kanaloa, Codex CLI, Claude Code, etc.) implements this contract.
+    Adapters translate the Kane runtime contract to an Agent implementation.
     """
 
     def __init__(self, event_handler: AgentEventHandler | None = None) -> None:

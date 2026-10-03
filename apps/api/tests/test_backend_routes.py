@@ -11,7 +11,7 @@ from httpx import ASGITransport, AsyncClient
 from app.adapters.mock_adapter import MockAdapter
 from app.adapters.kanaloa_adapter import KanaloaAdapter
 from app.adapters.kanaloa_adapter import PendingPermissionRequest
-from app.domain.models import AgentCapabilities, Conversation, Message, Turn
+from app.domain.models import AgentCapabilities, Conversation, Message, Turn, TurnEvent
 from app.harness.coordinator import HarnessCoordinator
 from app.harness.dispatcher import Dispatcher
 from app.harness.mailbox import MailboxManager
@@ -51,7 +51,7 @@ class LoopHttpAdapter(KanaloaAdapter):
             if self.complete_first:
                 await self.event_handler.emit_delta(self._session_turns["http_loop_session"], "[COMPLETE]")
                 self.runtime.record_delta(self._session_turns["http_loop_session"], "[COMPLETE]")
-            return {"result": {"stopReason": "endTurn"}}
+            return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
         return {"result": {}}
 
 
@@ -85,6 +85,155 @@ def app_env():
 
     yield app, store, coord, disp, adapter
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_conversation_rejects_unregistered_agent(app_env):
+    app, store, _, _, _ = app_env
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/conversations",
+            json={"title": "Unavailable", "bound_agent_id": "not_connected"},
+        )
+    assert response.status_code == 400
+    assert store.list_conversations() == []
+
+
+@pytest.mark.asyncio
+async def test_conversation_rename_title_only_and_real_delete(app_env):
+    app, store, _, _, _ = app_env
+    conversation = Conversation(title="Before")
+    other = Conversation(title="Keep")
+    store.save_conversation(conversation)
+    store.save_conversation(other)
+    branch = store.get_or_create_main_branch(conversation.conversation_id)
+    turn = Turn(conversation_id=conversation.conversation_id, bound_agent_id="kanaloa", branch_id=branch.branch_id, status="finished")
+    store.save_turn(turn)
+    message = Message(conversation_id=conversation.conversation_id, turn_id=turn.turn_id, sender="user", content="Disposable")
+    store.append_message(message, delivery_kind="message")
+    store.append_event(TurnEvent(conversation_id=conversation.conversation_id, turn_id=turn.turn_id, event_type="progress"))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        url = f"/api/v1/conversations/{conversation.conversation_id}"
+        response = await client.patch(url, json={"title": " After "})
+        assert response.status_code == 200
+        assert response.json() == {**conversation.model_dump(), "title": "After"}
+        assert (await client.patch(url, json={"title": " ", "bound_agent_id": "other"})).status_code == 422
+        assert (await client.delete(url)).status_code == 204
+        assert (await client.get(url)).status_code == 404
+        assert (await client.delete(url)).status_code == 404
+    assert store.get_turn(turn.turn_id) is None
+    assert store.get_messages(conversation.conversation_id) == []
+    assert store.list_branches(conversation.conversation_id) == []
+    assert store.list_events(turn.turn_id) == []
+    assert store.list_unsettled_inbound() == []
+    assert store.get_conversation(other.conversation_id) == other
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["running", "waiting_user"])
+async def test_conversation_delete_rejects_active_without_cancel(app_env, status):
+    app, store, _, _, _ = app_env
+    conversation = Conversation()
+    store.save_conversation(conversation)
+    turn = Turn(conversation_id=conversation.conversation_id, bound_agent_id="kanaloa", status=status)
+    store.save_turn(turn)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.delete(f"/api/v1/conversations/{conversation.conversation_id}")
+    assert response.status_code == 409
+    assert store.get_conversation(conversation.conversation_id) == conversation
+    assert store.get_turn(turn.turn_id) == turn
+
+
+@pytest.mark.asyncio
+async def test_agent_discovery_reports_missing_runtime_as_unavailable(app_env):
+    app, _, coordinator, _, _ = app_env
+    coordinator.register_adapter("kanaloa", KanaloaAdapter(command=["definitely-missing-kane-agent-binary"]))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/v1/agents")
+    assert response.status_code == 200
+    assert response.json()[0]["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_deactivate_rejects_active_work_and_reuses_close(app_env):
+    app, store, coordinator, _, _ = app_env
+    adapter = KanaloaAdapter(command=["node", "unused-acp-entrypoint"])
+    closed = []
+
+    async def close():
+        closed.append(True)
+
+    adapter.close = close
+    coordinator.register_adapter("kanaloa", adapter)
+    conversation = Conversation()
+    store.save_conversation(conversation)
+    turn = Turn(conversation_id=conversation.conversation_id, bound_agent_id="kanaloa", status="waiting_user")
+    store.save_turn(turn)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        assert (await client.post("/api/v1/agents/kanaloa/deactivate")).status_code == 409
+        assert not closed
+        turn.status = "interrupted"
+        store.save_turn(turn)
+        assert (await client.post("/api/v1/agents/kanaloa/deactivate")).status_code == 204
+    assert closed == [True]
+    assert coordinator.has_adapter("kanaloa")
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_model_config_updates_dsh_runtime_and_keeps_key_out_of_settings(app_env, tmp_path, monkeypatch):
+    app, store, coordinator, _, _ = app_env
+    coordinator.register_adapter("kanaloa", KanaloaAdapter(command=["node", "unused-acp-entrypoint"]))
+    monkeypatch.setenv("DSH_HOME", str(tmp_path / "runtime-home"))
+    runtime_home = tmp_path / "runtime-home"
+    runtime_home.mkdir()
+    (runtime_home / "settings.yaml").write_text(
+        "unrelated-runtime-setting:\n  keep: true\n"
+        "llm-pi-ai:\n  providers:\n    existing-provider:\n      baseURL: https://existing.example.test/v1\n",
+        encoding="utf-8",
+    )
+    secret = "test-only-kanaloa-api-key"
+    model_config = {
+        "base_url": "https://gateway.example.test/v1",
+        "model": "gateway-chat-model",
+        "api_key": secret,
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/api/v1/agents/kanaloa/model-config", json=model_config)
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "saved", "provider": "kane-kanaloa", "model": "gateway-chat-model"}
+    credential_file = tmp_path / "runtime-home" / ".credentials.yaml"
+    assert secret in credential_file.read_text(encoding="utf-8")
+    settings_file = tmp_path / "runtime-home" / "settings.yaml"
+    settings = settings_file.read_text(encoding="utf-8")
+    assert "https://gateway.example.test/v1" in settings
+    assert "gateway-chat-model" in settings
+    assert "KANE_KANALOA_API_KEY" in settings
+    assert "openai-completions" in settings
+    assert "existing-provider" in settings
+    assert "unrelated-runtime-setting" in settings
+    assert secret not in settings
+    assert secret not in str(store.list_agent_bindings())
+
+
+@pytest.mark.asyncio
+async def test_kanaloa_api_key_rejects_environment_override(app_env, tmp_path, monkeypatch):
+    app, _, coordinator, _, _ = app_env
+    coordinator.register_adapter("kanaloa", KanaloaAdapter(command=["node", "unused-acp-entrypoint"]))
+    monkeypatch.setenv("DSH_HOME", str(tmp_path / "runtime-home"))
+    monkeypatch.setenv("KANE_KANALOA_API_KEY", "process-managed-value")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/api/v1/agents/kanaloa/model-config", json={
+            "base_url": "https://gateway.example.test/v1",
+            "model": "gateway-chat-model",
+            "api_format": "openai-completions",
+            "api_key": "replacement",
+        })
+
+    assert response.status_code == 409
+    assert not (tmp_path / "runtime-home" / ".credentials.yaml").exists()
 
 
 @pytest.mark.asyncio

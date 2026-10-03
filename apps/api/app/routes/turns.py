@@ -169,7 +169,7 @@ async def respond_permission(
         )
 
     adapter = coordinator.get_adapter(turn.bound_agent_id)
-    if not hasattr(adapter, "respond_permission"):
+    if not adapter.capabilities().supports_approval:
         raise HTTPException(
             status_code=400,
             detail=f"Agent '{turn.bound_agent_id}' does not support permissions",
@@ -189,6 +189,8 @@ async def respond_permission(
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except NotImplementedError:
+        raise HTTPException(status_code=400, detail="Agent does not support permissions")
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
@@ -213,17 +215,19 @@ async def stream_turn_events(
     async def sse_event_stream():
         queue = coordinator.subscribe(turn_id)
         try:
+            current_turn = store.get_turn(turn_id)
+            if not current_turn:
+                return
             # 1. Send initial state snapshot
             snapshot_payload = {
-                "turn_id": turn.turn_id,
-                "status": turn.status,
-                "partial_output": turn.partial_output,
+                "turn_id": current_turn.turn_id,
+                "status": current_turn.status,
+                "partial_output": current_turn.partial_output,
             }
             yield f"event: snapshot\ndata: {json.dumps(snapshot_payload, ensure_ascii=False)}\n\n"
 
             # If already finished, failed, or interrupted, stream is done after snapshot
-            current_turn = store.get_turn(turn_id)
-            if current_turn and current_turn.status in ("finished", "failed", "interrupted"):
+            if current_turn.status in ("finished", "failed", "interrupted"):
                 return
 
             # 2. Stream live events

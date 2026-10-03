@@ -152,7 +152,9 @@ class MockAdapter(BaseAdapter):
             "session_id": session_id,
         }
         await self.event_handler.emit_waiting_user(
-            turn_id, prompt=f"Permission required for {tool_name} (request_id: {request_id})"
+            turn_id,
+            prompt=f"Permission required for {tool_name} (request_id: {request_id})",
+            record_message=False,
         )
 
     async def respond_permission(
