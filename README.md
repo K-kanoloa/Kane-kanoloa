@@ -1,6 +1,6 @@
-# Kane-Kanaloa v0.1 (Beta)
+# Kane-Kanaloa v3.0 (Beta)
 
-Release tag: **v0.1.0-beta**. Early evaluation release: **known and unknown bugs
+Release tag: **v3.0.0-beta**. Early evaluation release: **known and unknown bugs
 may exist**. This is not a production-readiness guarantee. Back up your data,
 use disposable workspaces for testing, and review Agent side effects.
 
@@ -40,7 +40,7 @@ Kane Core. Pinned DSH packages 0.1.5-rc.3 are installed with Kane; a separate
 stock DSH application is not required.
 
 ```powershell
-git clone --branch v0.1.0-beta https://github.com/alvin20062006-beep/Kane-Agent-Platform.git
+git clone --branch v3.0.0-beta https://github.com/alvin20062006-beep/Kane-Agent-Platform.git
 cd Kane-Agent-Platform
 npm ci
 npm run setup:api
@@ -97,7 +97,7 @@ Full suites were not rerun as a release gate; see [release notes](RELEASE_NOTES.
 - External compatibility, tools and Windows environment setup remain variable.
 - Current UI model configuration centers on OpenAI-compatible APIs.
 - Some historical docs and internal version metadata still say v2.0.0; the
-  release tag identifies this vNext v0.1 beta. Historical v2 tags remain unchanged.
+  release tag identifies this vNext v3 beta. Historical v2 tags remain unchanged.
 
 [CHANGELOG](CHANGELOG.md) | [RELEASE_NOTES](RELEASE_NOTES.md) |
 [Third-party notices](THIRD_PARTY_NOTICES.md).

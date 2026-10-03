@@ -1,10 +1,11 @@
 # Changelog
 
-## v0.1.0-beta - 2026-10-03
+## v3.0.0-beta - 2026-10-03
 
 New Kane-Kanaloa vNext evaluation baseline. Known and unknown bugs may exist;
-this is not a production-readiness claim. v0.1 identifies the new thin Harness
-product; historical v2 tags are preserved.
+this is not a production-readiness claim. v3 succeeds the previously released
+v2 with the new thin Harness architecture; historical v2 tags are preserved.
+The earlier v0.1.0-beta tag was a naming error and is superseded by v3.0.0-beta.
 
 - Thin model-free Conversation/Message/Turn/Branch Harness and SQLite Store.
 - Explicit completion, SSE, partial output and runtime-truth recovery.

@@ -1,9 +1,11 @@
-# Kane-Kanaloa v0.1.0-beta
+# Kane-Kanaloa v3.0.0-beta
 
 Date: 2026-10-03 (Australia/Sydney). Early evaluation release on
 `vnext/thin-harness`. **Known or unknown bugs may exist.** Not production,
 security, universal Agent compatibility or full product certification.
 Historical main/v2 tags are preserved; this release does not replace main.
+The earlier v0.1.0-beta tag was a naming error; v3.0.0-beta is the corrected
+release identity following v2. The old tag is retained for traceability.
 
 ## Scope
 
@@ -53,7 +55,7 @@ isolated independent child-process crash test.
 - All external Agents, fresh install, cross-machine reconnect, production
   deployment, load/security testing and full UI suite were not retested here.
 - Historical docs and package/API version strings may still report v2.0.0.
-  This release's identity is v0.1.0-beta.
+  This release's identity is v3.0.0-beta.
 - Never expose the default local unauthenticated service to the Internet.
 
 ## Data And Licensing
