@@ -1,0 +1,798 @@
+"""Kanaloa approval, completion and optional Loop regression tests."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from app.adapters.kanaloa_adapter import KanaloaAdapter, _UNSET
+from app.adapters.kanaloa_runtime import KanaloaRuntime
+from app.domain.models import Conversation, Message, Turn
+from app.harness.coordinator import HarnessCoordinator
+from app.harness.dispatcher import Dispatcher
+from app.harness.mailbox import MailboxManager
+from app.store.sqlite_store import SQLiteStore
+
+
+# --- Test Fixtures ---
+@pytest.fixture
+def harness_env():
+    store = SQLiteStore(":memory:")
+    mbx_mgr = MailboxManager()
+    coord = HarnessCoordinator(store, mbx_mgr)
+    dispatcher = Dispatcher(store, coord, mbx_mgr)
+    return store, mbx_mgr, coord, dispatcher
+
+
+class LoopMockWireKanaloaAdapter(KanaloaAdapter):
+    """Test helper for wire-level Kanaloa ACP loop and approval tests."""
+
+    def __init__(self, prompt_responses=None, **kwargs):
+        super().__init__(**kwargs)
+        self.cancel_notifs: list[dict[str, Any] | None] = []
+        self.steer_requests: list[dict[str, Any] | None] = []
+        self.prompt_requests: list[dict[str, Any]] = []
+        self.prompt_responses = prompt_responses or []
+        self._prompt_call_count = 0
+        self._new_session_id_counter = 1
+
+    async def _ensure_process(self) -> None:
+        self._is_initialized = True
+
+    async def _send_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
+        if method == "session/cancel":
+            self.cancel_notifs.append(params)
+
+    async def _send_request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        if method == "initialize":
+            return {"result": {"agentInfo": {"name": "dsh-acp", "version": "0.0.1"}}}
+        if method == "session/new":
+            sess_id = f"loop_sess_{self._new_session_id_counter}"
+            self._new_session_id_counter += 1
+            return {"result": {"sessionId": sess_id}}
+        if method == "session/steer":
+            self.steer_requests.append(params)
+            return {"result": {"accepted": True}}
+        if method == "session/prompt":
+            self.prompt_requests.append(params or {})
+            self._prompt_call_count += 1
+            # Return configured response or default completion
+            if self.prompt_responses and self._prompt_call_count <= len(self.prompt_responses):
+                resp = self.prompt_responses[self._prompt_call_count - 1]
+                if callable(resp):
+                    return await resp(params)
+                return resp
+            return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
+        if method == "session/close":
+            return {"result": {}}
+        return {"result": {}}
+
+
+# ==============================================================================
+# 3. Approval Disconnect Fail-Closed Tests
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_approval_disconnect_fail_closed_transitions_waiting_turn(harness_env):
+    """
+    Verify approval disconnect fail-closed:
+    1. Turn in waiting_user pending permission.
+    2. Subprocess disconnect occurs (e.g. stdout EOF or process exit).
+    3. Pending permission is invalidated and purged.
+    4. Turn transitions to 'interrupted' with reason 'permission_invalidated:acp_process_disconnected'.
+    5. Subsequent respond_permission call fails-closed with Unknown permission request.
+    """
+    store, mbx_mgr, coord, dispatcher = harness_env
+    kanaloa = KanaloaAdapter(event_handler=coord)
+
+    conv = Conversation(conversation_id="c_disc", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(
+        turn_id="t_disc_1",
+        conversation_id="c_disc",
+        bound_agent_id="kanaloa",
+        native_session_ref="sess_disc_1",
+        status="running",
+    )
+    store.save_turn(turn)
+    kanaloa.bind_session("t_disc_1", "sess_disc_1")
+
+    # 1. Incoming permission request puts Turn into waiting_user
+    await kanaloa._handle_incoming_rpc({
+        "jsonrpc": "2.0",
+        "id": 501,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "sess_disc_1",
+            "toolCall": {"toolName": "danger_eval"},
+        },
+    })
+    assert store.get_turn("t_disc_1").status == "waiting_user"
+    assert kanaloa.get_pending_permission(501) is not None
+
+    # 2. Simulate process disconnect / stdout EOF
+    await kanaloa._handle_disconnect(reason="acp_process_disconnected", purge=True)
+
+    # 3. Verification: Turn transitioned to interrupted
+    t_after = store.get_turn("t_disc_1")
+    assert t_after.status == "interrupted"
+
+    # 4. Verification: Pending permission purged
+    assert kanaloa.get_pending_permission(501) is None
+
+    # 5. Subsequent respond_permission fails-closed (unknown request)
+    with pytest.raises(ValueError, match="Unknown permission request '501'"):
+        await kanaloa.respond_permission(501, "allow-once")
+
+
+# ==============================================================================
+# 4. Optional Loop Mode Tests
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_loop_mode_invalid_values_fail_closed(harness_env):
+    """Verify invalid max_iterations values fail-closed immediately with ValueError."""
+    store, mbx_mgr, coord, dispatcher = harness_env
+    kanaloa = LoopMockWireKanaloaAdapter(event_handler=coord)
+
+    turn = Turn(turn_id="t_inv", conversation_id="c1", bound_agent_id="kanaloa")
+    msg = Message(conversation_id="c1", sender="user", content="hello")
+
+    # 0 is invalid
+    with pytest.raises(ValueError, match="must be None or a positive integer"):
+        await kanaloa.send(turn, msg, [], max_iterations=0)
+
+    # Negative int is invalid
+    with pytest.raises(ValueError, match="must be None or a positive integer"):
+        await kanaloa.send(turn, msg, [], max_iterations=-1)
+
+    # Float is invalid
+    with pytest.raises(ValueError, match="must be None or a positive integer"):
+        await kanaloa.send(turn, msg, [], max_iterations=3.5)
+
+    # String is invalid
+    with pytest.raises(ValueError, match="must be None or a positive integer"):
+        await kanaloa.send(turn, msg, [], max_iterations="5")
+
+    # Boolean is invalid (True is int subclass in python)
+    with pytest.raises(ValueError, match="must be None or a positive integer"):
+        await kanaloa.send(turn, msg, [], max_iterations=True)
+
+
+@pytest.mark.asyncio
+async def test_normal_mode_single_execution_without_loop_wrapper(harness_env):
+    """Verify Normal Mode (max_iterations unset): executes single prompt, no loop wrapper."""
+    store, mbx_mgr, coord, dispatcher = harness_env
+    kanaloa = LoopMockWireKanaloaAdapter(event_handler=coord)
+
+    conv = Conversation(conversation_id="c_norm", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(turn_id="t_norm", conversation_id="c_norm", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn)
+
+    msg = Message(conversation_id="c_norm", sender="user", content="run once")
+    await kanaloa.send(turn, msg, [])
+    # Wait for prompt task to complete
+    await asyncio.sleep(0.05)
+
+    assert kanaloa._prompt_call_count == 1
+    assert store.get_turn("t_norm").status == "finished"
+
+
+@pytest.mark.asyncio
+async def test_loop_mode_default_5_iterations(harness_env):
+    """Verify Loop Mode with max_iterations=5 runs exactly 5 iterations."""
+    store, mbx_mgr, coord, dispatcher = harness_env
+    kanaloa = LoopMockWireKanaloaAdapter(event_handler=coord)
+
+    conv = Conversation(conversation_id="c_loop5", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(turn_id="t_loop5", conversation_id="c_loop5", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn)
+
+    msg = Message(conversation_id="c_loop5", sender="user", content="iterate 5")
+    await kanaloa.send(turn, msg, [], max_iterations=5)
+    await asyncio.sleep(0.05)
+
+    assert kanaloa._prompt_call_count == 5
+    assert store.get_turn("t_loop5").status == "finished"
+
+
+@pytest.mark.asyncio
+async def test_loop_mode_early_complete(harness_env):
+    """Verify Loop Mode halts early when output contains COMPLETE at iteration 2."""
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    # Simulate iteration 2 emitting COMPLETE delta
+    async def mock_iter2_resp(params):
+        # Emit delta containing COMPLETE
+        await kanaloa.event_handler.emit_delta("t_early", "Task is finished. COMPLETE!")
+        kanaloa.runtime.record_delta("t_early", "Task is finished. COMPLETE!")
+        return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
+
+    kanaloa = LoopMockWireKanaloaAdapter(
+        prompt_responses=[
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 1
+            mock_iter2_resp,                         # iteration 2 -> COMPLETE
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 3 (should not run)
+        ],
+        event_handler=coord,
+    )
+
+    conv = Conversation(conversation_id="c_early", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(turn_id="t_early", conversation_id="c_early", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn)
+
+    msg = Message(conversation_id="c_early", sender="user", content="early stop test")
+    await kanaloa.send(turn, msg, [], max_iterations=5)
+    await asyncio.sleep(0.05)
+
+    # Only 2 iterations executed
+    assert kanaloa._prompt_call_count == 2
+    assert store.get_turn("t_early").status == "finished"
+
+
+@pytest.mark.asyncio
+async def test_loop_mode_custom_iterations_3_and_10(harness_env):
+    """Verify Loop Mode with custom max_iterations=3 and max_iterations=10."""
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    # 1. Custom = 3
+    kanaloa_3 = LoopMockWireKanaloaAdapter(event_handler=coord)
+    conv_3 = Conversation(conversation_id="c_c3", bound_agent_id="kanaloa")
+    store.save_conversation(conv_3)
+    turn_3 = Turn(turn_id="t_c3", conversation_id="c_c3", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn_3)
+
+    await kanaloa_3.send(turn_3, Message(conversation_id="c_c3", sender="user", content="3"), [], max_iterations=3)
+    await asyncio.sleep(0.05)
+    assert kanaloa_3._prompt_call_count == 3
+    assert store.get_turn("t_c3").status == "finished"
+
+    # 2. Custom = 10
+    kanaloa_10 = LoopMockWireKanaloaAdapter(event_handler=coord)
+    conv_10 = Conversation(conversation_id="c_c10", bound_agent_id="kanaloa")
+    store.save_conversation(conv_10)
+    turn_10 = Turn(turn_id="t_c10", conversation_id="c_c10", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn_10)
+
+    await kanaloa_10.send(turn_10, Message(conversation_id="c_c10", sender="user", content="10"), [], max_iterations=10)
+    await asyncio.sleep(0.05)
+    assert kanaloa_10._prompt_call_count == 10
+    assert store.get_turn("t_c10").status == "finished"
+
+
+@pytest.mark.asyncio
+async def test_loop_mode_unlimited_stops_on_complete(harness_env):
+    """Verify Unlimited Mode (max_iterations=None) runs past 5 without limit, stops on COMPLETE."""
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    async def mock_iter_resp(params):
+        if kanaloa._prompt_call_count == 7:
+            await kanaloa.event_handler.emit_delta("t_unl", "All 7 steps done. COMPLETE.")
+            kanaloa.runtime.record_delta("t_unl", "All 7 steps done. COMPLETE.")
+        return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
+
+    kanaloa = LoopMockWireKanaloaAdapter(
+        prompt_responses=[mock_iter_resp] * 10,
+        event_handler=coord,
+    )
+
+    conv = Conversation(conversation_id="c_unl", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(turn_id="t_unl", conversation_id="c_unl", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn)
+
+    await kanaloa.send(turn, Message(conversation_id="c_unl", sender="user", content="unlimited"), [], max_iterations=None)
+    await asyncio.sleep(0.05)
+
+    # Successfully ran 7 iterations (> 5 default limit) and completed
+    assert kanaloa._prompt_call_count == 7
+    assert store.get_turn("t_unl").status == "finished"
+
+
+@pytest.mark.asyncio
+async def test_loop_mode_steer_during_loop(harness_env):
+    """Verify native steering sent during Loop Mode is accepted and modifies next prompt."""
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    kanaloa = LoopMockWireKanaloaAdapter(event_handler=coord)
+
+    conv = Conversation(conversation_id="c_lsteer", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(turn_id="t_lsteer", conversation_id="c_lsteer", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn)
+
+    # Start loop
+    await kanaloa.send(turn, Message(conversation_id="c_lsteer", sender="user", content="init"), [], max_iterations=3)
+
+    # Steer before iteration 2
+    steer_msg = Message(conversation_id="c_lsteer", sender="user", content="CHANGE DIRECTION TO X")
+    await kanaloa.steer(turn, steer_msg)
+
+    assert len(kanaloa.steer_requests) == 1
+    assert kanaloa.steer_requests[0]["prompt"][0]["text"] == "CHANGE DIRECTION TO X"
+
+    await asyncio.sleep(0.05)
+    assert kanaloa._prompt_call_count == 3
+    assert store.get_turn("t_lsteer").status == "finished"
+
+
+@pytest.mark.asyncio
+async def test_loop_mode_approval_during_loop(harness_env):
+    """Verify approval request during Loop Mode pauses turn in waiting_user, resumes and completes loop."""
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    kanaloa = LoopMockWireKanaloaAdapter(event_handler=coord)
+    # Mock subprocess stdin for respond_permission
+    written_data: list[str] = []
+    mock_stdin = AsyncMock()
+    mock_stdin.write = MagicMock(side_effect=lambda b: written_data.append(b.decode("utf-8")))
+    mock_stdin.drain = AsyncMock()
+    mock_process = MagicMock()
+    mock_process.stdin = mock_stdin
+    mock_process.returncode = None
+    kanaloa._process = mock_process
+
+    conv = Conversation(conversation_id="c_lappr", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(turn_id="t_lappr", conversation_id="c_lappr", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn)
+
+    # Start loop (max_iterations=3)
+    await kanaloa.send(turn, Message(conversation_id="c_lappr", sender="user", content="loop with approval"), [], max_iterations=3)
+    sess_id = turn.native_session_ref or "loop_sess_1"
+
+    # Simulate permission request during loop
+    await kanaloa._handle_incoming_rpc({
+        "jsonrpc": "2.0",
+        "id": 888,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": sess_id,
+            "toolCall": {"toolName": "danger_eval"},
+            "options": [{"optionId": "allow-once"}, {"optionId": "reject-once"}],
+        },
+    })
+
+    assert store.get_turn("t_lappr").status == "waiting_user"
+    assert kanaloa.get_pending_permission(888) is not None
+
+    # User responds allow-once
+    await kanaloa.respond_permission(888, "allow-once", session_id=sess_id)
+    assert store.get_turn("t_lappr").status == "running"
+
+    await asyncio.sleep(0.05)
+    assert kanaloa._prompt_call_count == 3
+    assert store.get_turn("t_lappr").status == "finished"
+
+
+@pytest.mark.asyncio
+async def test_loop_mode_cancel_during_loop(harness_env):
+    """Verify cancellation during Loop Mode immediately halts iterations."""
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    async def cancel_on_iter2(params):
+        # Cancel turn during iteration 2
+        turn_obj = store.get_turn("t_lcancel")
+        await kanaloa.cancel(turn_obj)
+        return {"result": {"stopReason": "cancelled"}}
+
+    kanaloa = LoopMockWireKanaloaAdapter(
+        prompt_responses=[
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iter 1
+            cancel_on_iter2,                         # iter 2 cancels
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iter 3 should never run
+        ],
+        event_handler=coord,
+    )
+
+    conv = Conversation(conversation_id="c_lcancel", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(turn_id="t_lcancel", conversation_id="c_lcancel", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn)
+
+    await kanaloa.send(turn, Message(conversation_id="c_lcancel", sender="user", content="cancel test"), [], max_iterations=5)
+    await asyncio.sleep(0.05)
+
+    assert kanaloa._prompt_call_count == 2
+    assert store.get_turn("t_lcancel").status == "interrupted"
+    assert len(kanaloa.cancel_notifs) == 1
+
+
+# ==============================================================================
+# 5. Non-Fragile COMPLETE Marker and Termination Invariant Tests
+# ==============================================================================
+
+def test_complete_marker_robustness():
+    """Verify strict, non-fragile COMPLETE marker detection rejecting false positives."""
+    positive_samples = [
+        "Task is finished. [COMPLETE]",
+        "Task is finished.\n[COMPLETE]",
+        "All done. [COMPLETE]",
+        "[complete]",
+        "[COMPLETE]",
+        "COMPLETE",
+        "  COMPLETE!  ",
+        "**COMPLETE**",
+        "`COMPLETE`",
+        "Step 1 done.\nCOMPLETE\n",
+        "Task is finished. COMPLETE!",
+    ]
+    negative_samples = [
+        "not COMPLETE yet",
+        "COMPLETE condition not met",
+        "This is not COMPLETE.",
+        "Will it be COMPLETE soon?",
+        "Incomplete task",
+        "This is a completely different sentence.",
+        "We need complete information.",
+        "",
+        None,
+    ]
+    for text in positive_samples:
+        assert KanaloaRuntime.is_complete_marker(text), f"Expected True for: {text!r}"
+    for text in negative_samples:
+        assert not KanaloaRuntime.is_complete_marker(text), f"Expected False for: {text!r}"
+
+
+@pytest.mark.asyncio
+async def test_loop_mode_stop_does_not_start_next_iteration(harness_env):
+    """
+    Verify Stop condition (Section 8.A):
+    - Loop runs at least 1 iteration.
+    - Caller signals stop_loop during iteration 1.
+    - Iteration 1 finishes, iteration 2 does NOT start.
+    - Loop exits gracefully with emit_message_complete and turn status 'finished'.
+    """
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    async def mock_iter1_with_stop(params):
+        turn_obj = store.get_turn("t_lstop")
+        kanaloa.stop_loop(turn_obj)
+        return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
+
+    kanaloa = LoopMockWireKanaloaAdapter(
+        prompt_responses=[
+            mock_iter1_with_stop,
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 2 must NOT run
+        ],
+        event_handler=coord,
+    )
+
+    conv = Conversation(conversation_id="c_lstop", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(turn_id="t_lstop", conversation_id="c_lstop", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn)
+
+    await kanaloa.send(turn, Message(conversation_id="c_lstop", sender="user", content="stop test"), [], max_iterations=5)
+    await asyncio.sleep(0.05)
+
+    # Exactly 1 iteration executed
+    assert kanaloa._prompt_call_count == 1
+    # Turn finished gracefully
+    assert store.get_turn("t_lstop").status == "finished"
+
+
+@pytest.mark.asyncio
+async def test_loop_mode_failed_halts_loop_immediately(harness_env):
+    """
+    Verify failed condition (Section 8.B):
+    - Iteration 1 receives an explicit Agent work-failed completion.
+    - Loop terminates immediately without starting next iteration.
+    - Turn transitions to 'failed'.
+    """
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    kanaloa = LoopMockWireKanaloaAdapter(
+        prompt_responses=[
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "error"}}},
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 2 must NOT run
+        ],
+        event_handler=coord,
+    )
+
+    conv = Conversation(conversation_id="c_lfail", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(turn_id="t_lfail", conversation_id="c_lfail", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn)
+
+    await kanaloa.send(turn, Message(conversation_id="c_lfail", sender="user", content="fail test"), [], max_iterations=5)
+    await asyncio.sleep(0.05)
+
+    # Exactly 1 iteration executed
+    assert kanaloa._prompt_call_count == 1
+    # Turn marked as failed
+    assert store.get_turn("t_lfail").status == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loop_mode", [False, True])
+async def test_stdio_failure_is_interrupted_not_failed(harness_env, loop_mode):
+    store, _, coord, _ = harness_env
+
+    async def broken_prompt(_params):
+        raise BrokenPipeError("stdio disconnected")
+
+    adapter = LoopMockWireKanaloaAdapter(prompt_responses=[broken_prompt], event_handler=coord)
+    conv = Conversation(conversation_id="c_stdio", bound_agent_id="kanaloa")
+    turn = Turn(turn_id="t_stdio", conversation_id=conv.conversation_id,
+                bound_agent_id="kanaloa", partial_output="Partial answer")
+    store.save_conversation(conv)
+    store.save_turn(turn)
+    message = Message(conversation_id=conv.conversation_id, sender="user", content="Work")
+    if loop_mode:
+        await adapter.send(turn, message, [], max_iterations=5)
+    else:
+        await adapter.send(turn, message, [])
+    await asyncio.sleep(0.05)
+    persisted = store.get_turn(turn.turn_id)
+    assert persisted.status == "interrupted"
+    assert persisted.partial_output == "Partial answer"
+    assert "BrokenPipeError" in persisted.interrupt_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loop_mode", [False, True])
+@pytest.mark.parametrize("stop_reason", [None, "end_turn", "max_tokens", "unexpected"])
+async def test_nonterminal_acp_stop_never_finalizes_message(harness_env, loop_mode, stop_reason):
+    store, _, coord, _ = harness_env
+    adapter = LoopMockWireKanaloaAdapter(
+        prompt_responses=[{"result": {"stopReason": stop_reason}}],
+        event_handler=coord,
+    )
+    conv = Conversation(conversation_id="c_stop", bound_agent_id="kanaloa")
+    turn = Turn(
+        turn_id="t_stop", conversation_id=conv.conversation_id,
+        bound_agent_id="kanaloa", partial_output="Partial answer",
+    )
+    store.save_conversation(conv)
+    store.save_turn(turn)
+    message = Message(conversation_id=conv.conversation_id, sender="user", content="Work")
+    if loop_mode:
+        await adapter.send(turn, message, [], max_iterations=5)
+    else:
+        await adapter.send(turn, message, [])
+    await asyncio.sleep(0.05)
+
+    persisted = store.get_turn(turn.turn_id)
+    assert persisted.status == "interrupted"
+    assert persisted.partial_output == "Partial answer"
+    assert store.get_messages(conv.conversation_id) == []
+    assert adapter._prompt_call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loop_mode", [False, True])
+@pytest.mark.parametrize(
+    ("native_kind", "expected_status"),
+    [
+        ("completed", "finished"),
+        ("blocked", "failed"),
+        ("error", "failed"),
+        ("aborted", "interrupted"),
+        ("interrupted", "interrupted"),
+    ],
+)
+async def test_native_dsh_outcome_survives_acp_end_turn(harness_env, loop_mode, native_kind, expected_status):
+    store, _, coord, _ = harness_env
+    adapter = LoopMockWireKanaloaAdapter(
+        prompt_responses=[{"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": native_kind}}}],
+        event_handler=coord,
+    )
+    conv = Conversation(conversation_id="c_native", bound_agent_id="kanaloa")
+    turn = Turn(
+        turn_id="t_native", conversation_id=conv.conversation_id,
+        bound_agent_id="kanaloa", partial_output="Partial answer",
+    )
+    store.save_conversation(conv)
+    store.save_turn(turn)
+    message = Message(conversation_id=conv.conversation_id, sender="user", content="Work")
+    if loop_mode:
+        await adapter.send(turn, message, [], max_iterations=1)
+    else:
+        await adapter.send(turn, message, [])
+    await asyncio.sleep(0.05)
+
+    persisted = store.get_turn(turn.turn_id)
+    assert persisted.status == expected_status
+    assert adapter._prompt_call_count == 1
+    messages = store.get_messages(conv.conversation_id)
+    assert len(messages) == (1 if expected_status == "finished" else 0)
+    if expected_status != "finished":
+        assert persisted.partial_output == "Partial answer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loop_mode", [False, True])
+async def test_acp_error_does_not_persist_raw_message(harness_env, loop_mode, caplog):
+    store, _, coord, _ = harness_env
+    secret = "KANALOA_TEST_SECRET_DO_NOT_RECORD"
+    adapter = LoopMockWireKanaloaAdapter(
+        prompt_responses=[{"error": {"code": -32603, "message": secret}}],
+        event_handler=coord,
+    )
+    conv = Conversation(conversation_id="c_error", bound_agent_id="kanaloa")
+    turn = Turn(turn_id="t_error", conversation_id=conv.conversation_id, bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    store.save_turn(turn)
+    message = Message(conversation_id=conv.conversation_id, sender="user", content="Work")
+
+    if loop_mode:
+        await adapter.send(turn, message, [], max_iterations=5)
+    else:
+        await adapter.send(turn, message, [])
+    await asyncio.sleep(0.05)
+
+    persisted = store.get_turn(turn.turn_id)
+    assert persisted.status == "interrupted"
+    assert persisted.interrupt_reason == "acp_protocol:-32603"
+    assert secret not in caplog.text
+    assert secret not in str(store.list_events(turn.turn_id))
+
+
+@pytest.mark.asyncio
+async def test_process_disconnect_interrupts_active_turn_without_approval(harness_env):
+    store, _, coord, _ = harness_env
+    adapter = LoopMockWireKanaloaAdapter(event_handler=coord)
+    conv = Conversation(conversation_id="c_exit", bound_agent_id="kanaloa")
+    turn = Turn(turn_id="t_exit", conversation_id=conv.conversation_id,
+                bound_agent_id="kanaloa", native_session_ref="session_exit")
+    store.save_conversation(conv)
+    store.save_turn(turn)
+    adapter.bind_session(turn.turn_id, "session_exit")
+    await adapter._handle_disconnect(reason="acp_process_disconnected")
+    assert store.get_turn(turn.turn_id).status == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_loop_mode_interrupted_halts_loop_immediately(harness_env):
+    """
+    Verify interrupted condition (Section 8.C):
+    - Iteration 1 experiences external interruption (e.g. process crash or manual interruption).
+    - Turn enters 'interrupted'.
+    - Loop halts immediately without starting next iteration.
+    """
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    async def mock_iter1_external_interrupt(params):
+        # Simulate external interruption entering store
+        await coord.emit_interrupted("t_linter", reason="external_worker_eviction")
+        return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
+
+    kanaloa = LoopMockWireKanaloaAdapter(
+        prompt_responses=[
+            mock_iter1_external_interrupt,
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 2 must NOT run
+        ],
+        event_handler=coord,
+    )
+
+    conv = Conversation(conversation_id="c_linter", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(turn_id="t_linter", conversation_id="c_linter", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn)
+
+    await kanaloa.send(turn, Message(conversation_id="c_linter", sender="user", content="interrupt test"), [], max_iterations=5)
+    await asyncio.sleep(0.05)
+
+    assert kanaloa._prompt_call_count == 1
+    assert store.get_turn("t_linter").status == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_loop_mode_approval_does_not_increment_iteration(harness_env):
+    """
+    Verify approval does not increment iteration (Section 9):
+    - iteration 1 -> approval request -> waiting_user -> allow-once -> resume same work-cycle.
+    - iteration 1 completes with [COMPLETE].
+    - Final iteration count is strictly 1.
+    """
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    async def mock_iter1_with_approval(params):
+        sess_id = params.get("sessionId")
+        # Trigger permission request during iteration 1
+        await kanaloa._handle_incoming_rpc({
+            "jsonrpc": "2.0",
+            "id": 991,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": sess_id,
+                "toolCall": {"toolName": "shell_run"},
+                "options": [{"optionId": "allow-once"}, {"optionId": "reject-once"}],
+            },
+        })
+        assert store.get_turn("t_lappr_cnt").status == "waiting_user"
+        assert kanaloa.runtime.get_loop_iteration("t_lappr_cnt") == 1
+
+        # User responds allow-once to resume same work-cycle
+        await kanaloa.respond_permission(991, "allow-once", session_id=sess_id)
+        assert store.get_turn("t_lappr_cnt").status == "running"
+
+        # Emit [COMPLETE] delta within same iteration
+        await kanaloa.event_handler.emit_delta("t_lappr_cnt", "Execution finished after approval. [COMPLETE]")
+        kanaloa.runtime.record_delta("t_lappr_cnt", "Execution finished after approval. [COMPLETE]")
+        return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
+
+    kanaloa = LoopMockWireKanaloaAdapter(
+        prompt_responses=[
+            mock_iter1_with_approval,
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 2 must NOT run
+        ],
+        event_handler=coord,
+    )
+    # Mock subprocess stdin for respond_permission
+    mock_stdin = AsyncMock()
+    mock_stdin.write = MagicMock()
+    mock_stdin.drain = AsyncMock()
+    mock_process = MagicMock()
+    mock_process.stdin = mock_stdin
+    mock_process.returncode = None
+    kanaloa._process = mock_process
+
+    conv = Conversation(conversation_id="c_lappr_cnt", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(turn_id="t_lappr_cnt", conversation_id="c_lappr_cnt", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn)
+
+    await kanaloa.send(turn, Message(conversation_id="c_lappr_cnt", sender="user", content="approval count test"), [], max_iterations=5)
+    await asyncio.sleep(0.05)
+
+    # Exactly 1 work-cycle / prompt call executed
+    assert kanaloa._prompt_call_count == 1
+    assert store.get_turn("t_lappr_cnt").status == "finished"
+
+
+@pytest.mark.asyncio
+async def test_loop_mode_steer_does_not_increment_iteration(harness_env):
+    """
+    Verify steer does not increment iteration (Section 9):
+    - iteration 1 runs normally.
+    - iteration 2 is running -> mid-flight steer is injected.
+    - iteration 2 continues and completes with [COMPLETE].
+    - Final prompt call count is exactly 2 (iteration 2), steer did NOT create iteration 3.
+    """
+    store, mbx_mgr, coord, dispatcher = harness_env
+
+    async def mock_iter2_with_steer(params):
+        turn_obj = store.get_turn("t_lsteer_cnt")
+        assert kanaloa.runtime.get_loop_iteration("t_lsteer_cnt") == 2
+        # Mid-flight steer injected during iteration 2
+        steer_msg = Message(conversation_id="c_lsteer_cnt", sender="user", content="Adjust direction")
+        await kanaloa.steer(turn_obj, steer_msg)
+
+        # Iteration count must remain 2 during and after steer
+        assert kanaloa.runtime.get_loop_iteration("t_lsteer_cnt") == 2
+
+        # Complete iteration 2
+        await kanaloa.event_handler.emit_delta("t_lsteer_cnt", "Adjusted and finished. [COMPLETE]")
+        kanaloa.runtime.record_delta("t_lsteer_cnt", "Adjusted and finished. [COMPLETE]")
+        return {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}}
+
+    kanaloa = LoopMockWireKanaloaAdapter(
+        prompt_responses=[
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 1
+            mock_iter2_with_steer,                   # iteration 2 with steer + COMPLETE
+            {"result": {"stopReason": "end_turn", "_meta": {"kaneNativeEndKind": "completed"}}},  # iteration 3 must NOT run
+        ],
+        event_handler=coord,
+    )
+
+    conv = Conversation(conversation_id="c_lsteer_cnt", bound_agent_id="kanaloa")
+    store.save_conversation(conv)
+    turn = Turn(turn_id="t_lsteer_cnt", conversation_id="c_lsteer_cnt", bound_agent_id="kanaloa", status="running")
+    store.save_turn(turn)
+
+    await kanaloa.send(turn, Message(conversation_id="c_lsteer_cnt", sender="user", content="steer count test"), [], max_iterations=5)
+    await asyncio.sleep(0.05)
+
+    # Prompt call count is exactly 2
+    assert kanaloa._prompt_call_count == 2
+    assert len(kanaloa.steer_requests) == 1
+    assert store.get_turn("t_lsteer_cnt").status == "finished"

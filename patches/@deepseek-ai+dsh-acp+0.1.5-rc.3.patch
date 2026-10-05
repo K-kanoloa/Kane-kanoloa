@@ -1,0 +1,42 @@
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -869,6 +869,27 @@
+ 		this.cancelPrompt("ACP prompt cancelled");
+ 		if (inflight === void 0) this.agent.cancel({ kind: "user" });
+ 	}
++	/** Submit steering for the nearest step boundary without cancelling or restarting. */
++	async steer(params) {
++		this.assertActive();
++		if (this.ctx.agents.get(this.agent.id) !== this.agent) {
++			throw internalError$1("steer was not queued: the agent was disposed");
++		}
++		if (this.agent.status !== "running") {
++			throw invalidParams$1(`cannot steer session "${this.agent.session.id}": session is not running (status: ${this.agent.status})`);
++		}
++		const promptBlocks = Array.isArray(params.prompt) ? params.prompt : [{ type: "text", text: String(params.prompt ?? "") }];
++		const promptSelection = this.modelControl.snapshot();
++		const admissionController = new AbortController();
++		const content = await admitAcpPrompt(this.ctx, promptSelection, promptBlocks, false, admissionController.signal);
++		admissionController.signal.throwIfAborted();
++		const message = createUserMessage({
++			content,
++			source: { kind: "user" }
++		});
++		this.agent.steer(message);
++		return { accepted: true };
++	}
+ 	/**
+ 	* Process one durable event and enqueue its standard ACP projections.
+ 	* @param session - exact event-owning Session.
+@@ -1310,6 +1331,10 @@
+ 			return requireSession(brandString(params.sessionId)).prompt(params, imagePromptEnabled, requestSignal);
+ 		},
++		async steer(params) {
++			assertOpen();
++			return requireSession(brandString(params.sessionId)).steer(params);
++		},
+ 		cancel(params) {
+ 			sessions.get(brandString(params.sessionId))?.cancel();
+ 			return Promise.resolve();
+@@ -1322,7 +1347,7 @@
+ 	}).onRequest(methods.agent.session.new, ({ params, signal }) => implementation.newSession(params, signal)).onRequest(methods.agent.session.list, ({ params, signal }) => implementation.listSessions(params, signal)).onRequest(methods.agent.session.resume, ({ params, signal }) => implementation.resumeSession(params, signal)).onRequest(methods.agent.session.close, ({ params }) => implementation.closeSession(params)).onRequest(methods.agent.session.setConfigOption, ({ params, signal }) => implementation.setSessionConfigOption(params, signal)).onRequest(methods.agent.session.prompt, ({ params, signal }) => implementation.prompt(params, signal)).onRequest("session/steer", (params) => params, ({ params }) => implementation.steer(params)).onNotification("session/steer", (params) => params, ({ params }) => implementation.steer(params)).onNotification(methods.agent.session.cancel, ({ params }) => implementation.cancel(params)).connect(stream);
