@@ -1,0 +1,14 @@
+{
+  "name": "@kane/kanaloa-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "setup": "node setup.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "0.1.5-rc.3",
+    "@deepseek-ai/dsh-llm": "0.1.5-rc.3"
+  }
+}

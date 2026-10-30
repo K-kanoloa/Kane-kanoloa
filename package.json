@@ -1,0 +1,34 @@
+{
+  "name": "kane-agent-platform",
+  "private": true,
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "version": "3.0.1-beta",
+  "description": "Kane-Kanaloa: long-running conversations and persistent AI execution.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/patch-dsh-acp.mjs",
+    "setup": "node scripts/setup.mjs",
+    "setup:api": "node scripts/setup-python.mjs apps/api",
+    "setup:bridge": "node scripts/setup-python.mjs apps/local-bridge",
+    "setup:codex": "node scripts/setup-python.mjs connectors/codex",
+    "setup:mcp": "node scripts/setup-python.mjs connectors/kane-mcp",
+    "setup:kanaloa-tools": "npm --workspace @kane/kanaloa-tools run setup",
+    "build": "npm --workspace @kane/web run build",
+    "start": "node scripts/start.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "dev:web": "npm --workspace @kane/web run dev",
+    "typecheck": "npm --workspace @kane/web run typecheck",
+    "lint": "npm --workspace @kane/web run lint"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.5-rc.3",
+    "@deepseek-ai/dsh-acp": "0.1.5-rc.3"
+  },
+  "engines": {
+    "node": ">=24.0.0 <25",
+    "npm": ">=10"
+  }
+}
